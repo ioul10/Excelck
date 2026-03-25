@@ -11,6 +11,7 @@ from pathlib import Path
 from core.extractor import PDFExtractor
 from core.transformer import FiscalTransformer
 from core.excel_builder import ExcelBuilder
+from core.template_filler import TemplateFiller  # ← AJOUTÉ : Import du TemplateFiller
 from utils.validator import validate_pdf_structure
 from utils.logger import get_logger
 
@@ -94,9 +95,11 @@ st.markdown("""
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.image("https://img.icons8.com/color/96/microsoft-excel-2019.png", width=60)
+    
     st.markdown("### ⚙️ Options")
     
-    # NOUVEAU : Mode de génération
+    # Mode de génération
     generation_mode = st.radio(
         "Mode de génération",
         ["Excel avec formules (nouveau)", "Remplir template existant"],
@@ -111,8 +114,6 @@ with st.sidebar:
         )
     
     opt_dashboard = st.toggle("Feuille Tableau de Bord", value=True)
-    st.image("https://img.icons8.com/color/96/microsoft-excel-2019.png", width=60)
-    st.markdown("### ⚙️ Options")
     opt_formulas  = st.toggle("Formules dynamiques",     value=True)
     opt_colors    = st.toggle("Mise en forme colorée",   value=True)
 
@@ -160,10 +161,12 @@ with col_info:
 if uploaded:
     st.markdown("---")
 
-    # Sauvegarder temporairement
+    # Sauvegarder temporairement le PDF
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded.getbuffer())
         tmp_path = tmp.name
+
+    template_tmp_path = None  # Pour le cleanup du template
 
     try:
         # ── Progression ──
@@ -229,10 +232,11 @@ if uploaded:
         progress.progress(88, text="Génération Excel...")
 
         output_path = tmp_path.replace(".pdf", ".xlsx")
+        stats = {}  # ← Initialisation pour éviter l'erreur UnboundLocalError
 
         with st.spinner("Construction du classeur Excel..."):
             if generation_mode == "Excel avec formules (nouveau)":
-                # Mode actuel
+                # Mode actuel : création from scratch
                 builder = ExcelBuilder(
                     fiscal_data,
                     with_dashboard=opt_dashboard,
@@ -241,21 +245,19 @@ if uploaded:
                 )
                 stats = builder.build(output_path)
             else:
-               # NOUVEAU : Remplir template
-               if template_file:
-                  # Sauvegarder temporairement le template
-                  with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_tpl:
-                       tmp_tpl.write(template_file.getbuffer())
-                       template_path = tmp_tpl.name
-            
-                  filler = TemplateFiller(template_path)
-                  stats = filler.fill_from_data(fiscal_data, output_path)
-            
-                  # Nettoyage
-                  os.unlink(template_path)
-               else:
-                  st.error("Veuillez uploader un template Excel")
-                  st.stop()
+                # NOUVEAU : Remplir template existant
+                if template_file:
+                    # Sauvegarder temporairement le template
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_tpl:
+                        tmp_tpl.write(template_file.getbuffer())
+                        template_tmp_path = tmp_tpl.name
+                    
+                    filler = TemplateFiller(template_tmp_path)
+                    stats = filler.fill_from_data(fiscal_data, output_path)
+                else:
+                    st.error("⚠️ Veuillez uploader un template Excel pour utiliser ce mode")
+                    st.stop()
+
         progress.progress(100, text="✅ Terminé !")
         status.empty()
 
@@ -263,9 +265,9 @@ if uploaded:
         st.markdown(f"""
         <div class="success-banner">
             ✅ <strong>Fichier Excel généré avec succès !</strong>
-            &nbsp;·&nbsp; {stats['sheets']} feuilles
-            &nbsp;·&nbsp; {stats['formulas']} formules
-            &nbsp;·&nbsp; {stats['rows']} lignes de données
+            &nbsp;·&nbsp; {stats.get('sheets', '—')} feuilles
+            &nbsp;·&nbsp; {stats.get('formulas', '—')} formules
+            &nbsp;·&nbsp; {stats.get('rows', '—')} lignes de données
         </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
@@ -323,13 +325,19 @@ if uploaded:
             st.code(traceback.format_exc())
 
     finally:
-        # Nettoyage
+        # Nettoyage des fichiers temporaires
         for f in [tmp_path, tmp_path.replace(".pdf", ".xlsx")]:
             if os.path.exists(f):
                 try:
                     os.unlink(f)
                 except Exception:
                     pass
+        # Cleanup du template temporaire
+        if template_tmp_path and os.path.exists(template_tmp_path):
+            try:
+                os.unlink(template_tmp_path)
+            except Exception:
+                pass
 
 else:
     # État vide
