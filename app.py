@@ -94,6 +94,23 @@ st.markdown("""
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("### ⚙️ Options")
+    
+    # NOUVEAU : Mode de génération
+    generation_mode = st.radio(
+        "Mode de génération",
+        ["Excel avec formules (nouveau)", "Remplir template existant"],
+        help="Choisis entre créer un nouvel Excel ou remplir ton template"
+    )
+    
+    if generation_mode == "Remplir template existant":
+        template_file = st.file_uploader(
+            "📁 Template Excel",
+            type=["xlsx"],
+            help="Ton fichier Excel template à remplir"
+        )
+    
+    opt_dashboard = st.toggle("Feuille Tableau de Bord", value=True)
     st.image("https://img.icons8.com/color/96/microsoft-excel-2019.png", width=60)
     st.markdown("### ⚙️ Options")
 
@@ -216,14 +233,31 @@ if uploaded:
         output_path = tmp_path.replace(".pdf", ".xlsx")
 
         with st.spinner("Construction du classeur Excel..."):
-            builder = ExcelBuilder(
-                fiscal_data,
-                with_dashboard=opt_dashboard,
-                with_formulas=opt_formulas,
-                with_colors=opt_colors,
-            )
-            stats = builder.build(output_path)
-
+            if generation_mode == "Excel avec formules (nouveau)":
+                # Mode actuel
+                builder = ExcelBuilder(
+                    fiscal_data,
+                    with_dashboard=opt_dashboard,
+                    with_formulas=opt_formulas,
+                    with_colors=opt_colors,
+                )
+                stats = builder.build(output_path)
+            else:
+               # NOUVEAU : Remplir template
+               if template_file:
+                  # Sauvegarder temporairement le template
+                  with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_tpl:
+                       tmp_tpl.write(template_file.getbuffer())
+                       template_path = tmp_tpl.name
+            
+                  filler = TemplateFiller(template_path)
+                  stats = filler.fill_from_data(fiscal_data, output_path)
+            
+                  # Nettoyage
+                  os.unlink(template_path)
+               else:
+                  st.error("Veuillez uploader un template Excel")
+                  st.stop()
         progress.progress(100, text="✅ Terminé !")
         status.empty()
 
