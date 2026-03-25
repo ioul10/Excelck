@@ -146,7 +146,7 @@ def create_pro_excel(data):
     worksheet_passif = workbook.add_worksheet('3. Bilan Passif')
     # ... Même logique que l'actif ...
     # Pour l'exemple, on copie la structure
-     for col_num, header in enumerate(headers):
+    for col_num, header in enumerate(headers):
         worksheet_passif.write(0, col_num, header, header_fmt)
         
     row = 1
