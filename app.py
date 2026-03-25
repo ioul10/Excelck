@@ -113,8 +113,6 @@ with st.sidebar:
     opt_dashboard = st.toggle("Feuille Tableau de Bord", value=True)
     st.image("https://img.icons8.com/color/96/microsoft-excel-2019.png", width=60)
     st.markdown("### ⚙️ Options")
-
-    opt_dashboard = st.toggle("Feuille Tableau de Bord", value=True)
     opt_formulas  = st.toggle("Formules dynamiques",     value=True)
     opt_colors    = st.toggle("Mise en forme colorée",   value=True)
 
