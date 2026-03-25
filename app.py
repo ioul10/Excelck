@@ -1,265 +1,311 @@
+"""
+FiscalXL — Convertisseur PDF Fiscal → Excel Pro
+Point d'entrée Streamlit
+"""
+
 import streamlit as st
-import pdfplumber
-import pandas as pd
-import xlsxwriter
-import io
-import re
+import tempfile
+import os
+from pathlib import Path
 
-# Configuration de la page
-st.set_page_config(page_title="Excelck - Converter Fiscal", layout="wide")
+from core.extractor import PDFExtractor
+from core.transformer import FiscalTransformer
+from core.excel_builder import ExcelBuilder
+from utils.validator import validate_pdf_structure
+from utils.logger import get_logger
 
-st.title("📑 Excelck : PDF Fiscal vers Excel Dynamique")
+logger = get_logger(__name__)
+
+# ── Config page ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="FiscalXL — PDF → Excel",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── CSS personnalisé ─────────────────────────────────────────────────────────
 st.markdown("""
-Cette application transforme les annexes de la déclaration IS (Modèle Normal) 
-en un fichier Excel structuré, coloré et **calculant automatiquement les totaux**.
-""")
-
-# --- ÉTAPE 1 & 2 : EXTRACTION ET PARSING ---
-
-def extract_data_from_pdf(uploaded_file):
-    """
-    Extrait le texte et les tableaux du PDF.
-    Retourne un dictionnaire structuré par type de feuille.
-    """
-    data = {
-        "info_generale": {},
-        "actif": [],
-        "passif": [],
-        "cpc": []
+<style>
+    .main-header {
+        background: linear-gradient(135deg, #1F3864 0%, #2E75B6 100%);
+        padding: 2rem 2.5rem;
+        border-radius: 12px;
+        margin-bottom: 2rem;
+        color: white;
     }
-    
-    with pdfplumber.open(uploaded_file) as pdf:
-        # Page 1 : Informations Générales (Texte clé-valeur simplifié)
-        if len(pdf.pages) > 0:
-            page1 = pdf.pages[0]
-            text = page1.extract_text()
-            # Simulation d'extraction (à adapter selon le regex exact du formulaire)
-            data["info_generale"]["texte_brut"] = text
-            
-        # Pages 2-3 : Bilan Actif
-        # Pages 4 : Bilan Passif
-        # Page 5 : CPC
-        
-        # Pour cet exemple, on va extraire les tableaux bruts
-        # Dans un cas réel, il faudrait mapper les lignes spécifiques (Immobilisations, Stocks, etc.)
-        for i, page in enumerate(pdf.pages):
-            tables = page.extract_tables()
-            for table in tables:
-                df = pd.DataFrame(table)
-                if i == 0: continue # Skip page 1 for tables
-                
-                # Nettoyage basique des NaN
-                df = df.fillna("")
-                
-                if i in [1, 2]: # Actif
-                    data["actif"].append(df)
-                elif i == 3: # Passif
-                    data["passif"].append(df)
-                elif i == 4: # CPC
-                    data["cpc"].append(df)
-                    
-    return data
+    .main-header h1 { color: white; margin: 0; font-size: 2.2rem; }
+    .main-header p  { color: #BDD7EE; margin: 0.3rem 0 0; font-size: 1rem; }
 
-# --- ÉTAPE 3 & 4 : GÉNÉRATION EXCEL PRO AVEC FORMULES ---
+    .step-card {
+        background: #f8f9fa;
+        border-left: 4px solid #2E75B6;
+        padding: 1rem 1.2rem;
+        border-radius: 0 8px 8px 0;
+        margin: 0.5rem 0;
+    }
+    .step-card h4 { margin: 0 0 0.3rem; color: #1F3864; }
+    .step-card p  { margin: 0; color: #555; font-size: 0.9rem; }
 
-def create_pro_excel(data):
-    """
-    Génère un fichier Excel avec mise en forme et FORMULES de calcul.
-    """
-    output = io.BytesIO()
-    writer = pd.ExcelWriter(output, engine='xlsxwriter')
-    workbook = writer.book
-    
-    # --- DEFINITION DES STYLES (Mise en forme PRO) ---
-    header_fmt = workbook.add_format({
-        'bold': True, 'text_wrap': True, 'valign': 'top',
-        'fg_color': '#2E75B6', 'font_color': '#FFFFFF', 'border': 1
-    })
-    
-    total_fmt = workbook.add_format({
-        'bold': True, 'fg_color': '#D9E1F2', 'font_color': '#000000', 'border': 1, 'num_format': '#,##0.00'
-    })
-    
-    normal_fmt = workbook.add_format({
-        'border': 1, 'num_format': '#,##0.00', 'align': 'right'
-    })
-    
-    text_fmt = workbook.add_format({
-        'border': 1, 'align': 'left', 'text_wrap': True
-    })
+    .stat-box {
+        background: white;
+        border: 1px solid #BDD7EE;
+        border-radius: 8px;
+        padding: 1rem;
+        text-align: center;
+    }
+    .stat-box .value { font-size: 1.6rem; font-weight: bold; color: #1F3864; }
+    .stat-box .label { font-size: 0.8rem; color: #888; margin-top: 0.2rem; }
 
-    # --- FEUILLE 1 : INFORMATIONS GENERALES ---
-    df_info = pd.DataFrame([["Champ", "Valeur"]] + [[k, v] for k, v in data["info_generale"].items() if k != "texte_brut"])
-    # Note: Ici on met les données en dur car ce sont des infos statiques
-    df_info.to_excel(writer, sheet_name='1. Info Générale', index=False, startrow=1, header=False)
-    worksheet_info = writer.sheets['1. Info Générale']
-    worksheet_info.set_column('A:A', 30)
-    worksheet_info.set_column('B:B', 40)
+    .success-banner {
+        background: #E2EFDA;
+        border: 1px solid #70AD47;
+        border-radius: 8px;
+        padding: 1rem 1.5rem;
+        color: #375623;
+    }
+    .error-banner {
+        background: #FCE4D6;
+        border: 1px solid #C55A11;
+        border-radius: 8px;
+        padding: 1rem 1.5rem;
+        color: #7B2C00;
+    }
+    [data-testid="stFileUploader"] { border: 2px dashed #2E75B6 !important; border-radius: 10px; }
+    div[data-testid="stDownloadButton"] button {
+        background: linear-gradient(135deg, #1F3864, #2E75B6);
+        color: white;
+        border: none;
+        padding: 0.7rem 2rem;
+        font-size: 1rem;
+        border-radius: 8px;
+        width: 100%;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    # --- FEUILLE 2 : BILAN ACTIF (Avec Formules) ---
-    worksheet_actif = workbook.add_worksheet('2. Bilan Actif')
-    
-    # En-têtes
-    headers = ['Rubrique', 'N', 'N-1']
-    for col_num, header in enumerate(headers):
-        worksheet_actif.write(0, col_num, header, header_fmt)
-    
-    # Simulation de remplissage des données (Brut Net)
-    # Dans un cas réel, on mapperait les lignes extraites du PDF ici
-    row = 1
-    start_data_row = row
-    
-    # Exemple de structure comptable
-    items_actif = [
-        ("Immobilisations en non-valeurs", 10000, 10000),
-        ("Immobilisations incorporelles", 50000, 45000),
-        ("Immobilisations corporelles", 200000, 180000),
-        ("Immobilisations financières", 15000, 15000),
-        ("Ecarts de conversion Actif", 0, 0),
-        ("Créances de l'actif immobilisé", 5000, 4000),
-        ("Stocks et en-cours", 120000, 100000),
-        ("Créances de l'actif circulant", 80000, 70000),
-        ("Titres de placement", 30000, 25000),
-        ("Trésorerie Actif", 40000, 35000),
+# ── Header ───────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="main-header">
+    <h1>📊 FiscalXL</h1>
+    <p>Convertisseur automatique · Pièces annexes Déclaration IS → Excel structuré avec formules</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.image("https://img.icons8.com/color/96/microsoft-excel-2019.png", width=60)
+    st.markdown("### ⚙️ Options")
+
+    opt_dashboard = st.toggle("Feuille Tableau de Bord", value=True)
+    opt_formulas  = st.toggle("Formules dynamiques",     value=True)
+    opt_colors    = st.toggle("Mise en forme colorée",   value=True)
+
+    st.markdown("---")
+    st.markdown("### 📋 Structure détectée")
+    st.markdown("""
+    Le PDF doit contenir :
+    - **Page 1** — Infos générales
+    - **Page 2-3** — Bilan Actif
+    - **Page 3-4** — Bilan Passif
+    - **Page 4-5** — CPC
+    """)
+
+    st.markdown("---")
+    st.markdown("### ℹ️ À propos")
+    st.caption("FiscalXL v1.0 · Modèle Comptable Normal (loi 9-88)")
+
+# ── Layout principal ─────────────────────────────────────────────────────────
+col_upload, col_info = st.columns([3, 2])
+
+with col_upload:
+    st.markdown("### 📂 Importer le PDF")
+    uploaded = st.file_uploader(
+        "Glissez-déposez ou cliquez pour choisir",
+        type=["pdf"],
+        help="PDF de pièces annexes à la déclaration IS (Modèle Normal)",
+    )
+
+with col_info:
+    st.markdown("### 🔄 Étapes de traitement")
+    steps = [
+        ("1 · Extraction",   "Lecture du PDF avec pdfplumber"),
+        ("2 · Structuration","Détection des tableaux et des zones"),
+        ("3 · Relations",    "Reconstruction des formules & totaux"),
+        ("4 · Excel Pro",    "Génération du classeur multi-feuilles"),
     ]
-    
-    for item, val_n, val_n_1 in items_actif:
-        worksheet_actif.write(row, 0, item, text_fmt)
-        worksheet_actif.write(row, 1, val_n, normal_fmt) # Colonne N (Index 1)
-        worksheet_actif.write(row, 2, val_n_1, normal_fmt) # Colonne N-1 (Index 2)
-        row += 1
-        
-    end_data_row = row - 1
-    
-    # LIGNE DE TOTAL (C'est ici que la magie opère - ÉTAPE 3)
-    worksheet_actif.write(row, 0, "TOTAL ACTIF", total_fmt)
-    
-    # FORMULE EXCEL : =SUM(B2:B11)
-    # On utilise write_formula pour que Excel recalcule si on change une valeur
-    formula_n = f"=SUM(B{start_data_row+2}:B{end_data_row+2})" # +2 car Excel commence à 1 et on a une ligne header
-    formula_n_1 = f"=SUM(C{start_data_row+2}:C{end_data_row+2})"
-    
-    worksheet_actif.write_formula(row, 1, formula_n, total_fmt)
-    worksheet_actif.write_formula(row, 2, formula_n_1, total_fmt)
-    
-    # --- FEUILLE 3 : BILAN PASSIF (Avec Formules) ---
-    worksheet_passif = workbook.add_worksheet('3. Bilan Passif')
-    # ... Même logique que l'actif ...
-    # Pour l'exemple, on copie la structure
-    for col_num, header in enumerate(headers):
-        worksheet_passif.write(0, col_num, header, header_fmt)
-        
-    row = 1
-    items_passif = [
-        ("Capital social", 100000, 100000),
-        ("Primes d'émission", 10000, 10000),
-        ("Ecarts de réévaluation", 0, 0),
-        ("Réserves", 50000, 40000),
-        ("Report à nouveau", 20000, 15000),
-        ("Résultat net", 0, 0), # Sera lié au CPC
-        ("Subventions d'investissement", 30000, 30000),
-        ("Provisions durables", 10000, 10000),
-        ("Dettes de financement", 150000, 160000),
-        ("Provisions pour risques et charges", 5000, 4000),
-        ("Dettes du passif circulant", 90000, 80000),
-        ("Trésorerie Passif", 15000, 10000),
-    ]
-    
-    for item, val_n, val_n_1 in items_passif:
-        worksheet_passif.write(row, 0, item, text_fmt)
-        worksheet_passif.write(row, 1, val_n, normal_fmt)
-        worksheet_passif.write(row, 2, val_n_1, normal_fmt)
-        row += 1
-        
-    end_data_row = row - 1
-    worksheet_passif.write(row, 0, "TOTAL PASSIF", total_fmt)
-    
-    formula_n = f"=SUM(B{start_data_row+2}:B{end_data_row+2})"
-    formula_n_1 = f"=SUM(C{start_data_row+2}:C{end_data_row+2})"
-    
-    worksheet_passif.write_formula(row, 1, formula_n, total_fmt)
-    worksheet_passif.write_formula(row, 2, formula_n_1, total_fmt)
+    for title, desc in steps:
+        st.markdown(f"""
+        <div class="step-card">
+            <h4>{title}</h4>
+            <p>{desc}</p>
+        </div>""", unsafe_allow_html=True)
 
-    # --- FEUILLE 4 : CPC (Compte de Produits et Charges) ---
-    worksheet_cpc = workbook.add_worksheet('4. CPC')
-    headers_cpc = ['Rubrique', 'Montant N', 'Montant N-1']
-    for col_num, header in enumerate(headers_cpc):
-        worksheet_cpc.write(0, col_num, header, header_fmt)
-        
-    row = 1
-    # Structure simplifiée CPC
-    cpc_data = [
-        ("Ventes de marchandises", 500000, 450000),
-        ("Chiffre d'affaires", 500000, 450000),
-        ("Variation de stocks", 10000, 5000),
-        ("Production immobilisée", 0, 0),
-        ("Subventions d'exploitation", 20000, 20000),
-        ("Autres produits", 5000, 3000),
-        ("Achats revendus de marchandises", -200000, -180000),
-        ("Achats consommés", -100000, -90000),
-        ("Autres charges externes", -50000, -45000),
-        ("Impôts et taxes", -15000, -14000),
-        ("Charges de personnel", -120000, -110000),
-        ("Autres charges d'exploitation", -10000, -9000),
-        ("Dotations d'exploitation", -25000, -20000),
-        ("Résultat d'exploitation", 0, 0), # Formule
-        ("Résultat financier", -5000, -4000),
-        ("Résultat non courant", 2000, 1000),
-        ("Impôt sur les résultats", -10000, -8000),
-        ("Résultat Net", 0, 0) # Formule Finale
-    ]
-    
-    start_cpc_row = row
-    for item, val_n, val_n_1 in cpc_data:
-        # Si c'est une ligne de calcul (Résultat), on met 0 pour l'instant, la formule prendra le relais
-        is_calculation = "Résultat" in item
-        
-        worksheet_cpc.write(row, 0, item, text_fmt if not is_calculation else total_fmt)
-        
-        if not is_calculation:
-            worksheet_cpc.write(row, 1, val_n, normal_fmt)
-            worksheet_cpc.write(row, 2, val_n_1, normal_fmt)
-        else:
-            # Ici on prépare les formules complexes
-            # Exemple simplifié : Résultat d'exploitation = Somme des lignes précédentes
-            # Dans un vrai cas, il faut connaître les lignes exactes (Produits - Charges)
-            pass 
-        row += 1
-    
-    end_cpc_row = row - 1
-    
-    # Exemple de formule complexe pour le Résultat Net (Simulation)
-    # Disons que le Résultat Net est la somme de tout le CPC (simplification)
-    worksheet_cpc.write(end_cpc_row, 0, "RESULTAT NET (Formule)", total_fmt)
-    # Formule dynamique
-    formula_net_n = f"=SUM(B{start_cpc_row+2}:B{end_cpc_row+1})" 
-    worksheet_cpc.write_formula(end_cpc_row, 1, formula_net_n, total_fmt)
-    
-    # Fermeture du fichier
-    writer.close()
-    output.seek(0)
-    return output
+# ── Traitement ───────────────────────────────────────────────────────────────
+if uploaded:
+    st.markdown("---")
 
-# --- INTERFACE STREAMLIT ---
+    # Sauvegarder temporairement
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded.getbuffer())
+        tmp_path = tmp.name
 
-uploaded_file = st.file_uploader("Choisissez le PDF (Annexes IS)", type="pdf")
+    try:
+        # ── Progression ──
+        progress = st.progress(0, text="Initialisation...")
+        status   = st.empty()
 
-if uploaded_file is not None:
-    with st.spinner('Extraction et Analyse en cours...'):
-        # 1. Extraction
-        raw_data = extract_data_from_pdf(uploaded_file)
-        st.success("PDF analysé avec succès !")
-        
-        # Affichage rapide des données brutes extraites (Debug)
-        with st.expander("Voir les données brutes extraites"):
-            st.json(raw_data)
-            
-        # 2. Génération Excel
-        excel_file = create_pro_excel(raw_data)
-        
-        st.download_button(
-            label="📥 Télécharger l'Excel PRO (Avec Formules)",
-            data=excel_file,
-            file_name="Declaration_IS_Dynamique.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # Étape 1 : Validation
+        status.info("🔍 **Étape 1/4** — Validation de la structure PDF...")
+        progress.progress(10, text="Validation structure...")
+
+        with st.spinner("Lecture du PDF..."):
+            extractor = PDFExtractor(tmp_path)
+            validation = validate_pdf_structure(extractor)
+
+        if not validation["valid"]:
+            st.markdown(f"""
+            <div class="error-banner">
+                ⚠️ <strong>Structure non reconnue</strong><br>
+                {validation['message']}
+            </div>""", unsafe_allow_html=True)
+            st.stop()
+
+        progress.progress(25, text="Structure validée ✓")
+
+        # Afficher méta-données détectées
+        meta = validation["meta"]
+        c1, c2, c3, c4 = st.columns(4)
+        for col, (label, val) in zip(
+            [c1, c2, c3, c4],
+            [("Raison Sociale", meta.get("raison_sociale", "—")[:22]),
+             ("Identifiant Fiscal", meta.get("identifiant_fiscal", "—")),
+             ("Exercice", meta.get("exercice", "—")),
+             ("Pages détectées", str(meta.get("pages", "—")))]):
+            col.markdown(f"""
+            <div class="stat-box">
+                <div class="value">{val}</div>
+                <div class="label">{label}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Étape 2 : Extraction
+        status.info("📄 **Étape 2/4** — Extraction des données...")
+        progress.progress(40, text="Extraction des tableaux...")
+
+        with st.spinner("Extraction en cours..."):
+            data = extractor.extract_all()
+
+        progress.progress(60, text="Extraction complète ✓")
+
+        # Étape 3 : Transformation
+        status.info("🔗 **Étape 3/4** — Reconstruction des relations...")
+        progress.progress(70, text="Calcul des relations...")
+
+        with st.spinner("Structuration des données..."):
+            transformer = FiscalTransformer(data)
+            fiscal_data = transformer.transform()
+
+        progress.progress(80, text="Relations reconstruites ✓")
+
+        # Étape 4 : Excel
+        status.info("📊 **Étape 4/4** — Génération du fichier Excel...")
+        progress.progress(88, text="Génération Excel...")
+
+        output_path = tmp_path.replace(".pdf", ".xlsx")
+
+        with st.spinner("Construction du classeur Excel..."):
+            builder = ExcelBuilder(
+                fiscal_data,
+                with_dashboard=opt_dashboard,
+                with_formulas=opt_formulas,
+                with_colors=opt_colors,
+            )
+            stats = builder.build(output_path)
+
+        progress.progress(100, text="✅ Terminé !")
+        status.empty()
+
+        # ── Succès ──
+        st.markdown(f"""
+        <div class="success-banner">
+            ✅ <strong>Fichier Excel généré avec succès !</strong>
+            &nbsp;·&nbsp; {stats['sheets']} feuilles
+            &nbsp;·&nbsp; {stats['formulas']} formules
+            &nbsp;·&nbsp; {stats['rows']} lignes de données
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Prévisualisation ──
+        with st.expander("👁️ Aperçu des données extraites", expanded=False):
+            tabs = st.tabs(["Infos", "Bilan Actif", "Bilan Passif", "CPC"])
+
+            with tabs[0]:
+                st.json(fiscal_data.get("info", {}))
+
+            with tabs[1]:
+                actif = fiscal_data.get("bilan_actif", [])
+                if actif:
+                    import pandas as pd
+                    df = pd.DataFrame(actif,
+                        columns=["Poste", "Brut", "Amort.", "Net N", "Net N-1"])
+                    st.dataframe(df, use_container_width=True)
+
+            with tabs[2]:
+                passif = fiscal_data.get("bilan_passif", [])
+                if passif:
+                    import pandas as pd
+                    df = pd.DataFrame(passif, columns=["Poste", "Exercice N", "Exercice N-1"])
+                    st.dataframe(df, use_container_width=True)
+
+            with tabs[3]:
+                cpc = fiscal_data.get("cpc", [])
+                if cpc:
+                    import pandas as pd
+                    df = pd.DataFrame(cpc,
+                        columns=["Désignation", "Propre N", "Exerc. Préc.", "Total N", "Total N-1"])
+                    st.dataframe(df, use_container_width=True)
+
+        # ── Bouton de téléchargement ──
+        st.markdown("### ⬇️ Télécharger")
+        fname = Path(uploaded.name).stem + "_fiscal.xlsx"
+        with open(output_path, "rb") as f:
+            st.download_button(
+                label="📥 Télécharger le fichier Excel",
+                data=f,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    except Exception as e:
+        logger.exception("Erreur lors du traitement")
+        st.markdown(f"""
+        <div class="error-banner">
+            ❌ <strong>Erreur de traitement</strong><br>
+            <code>{str(e)}</code>
+        </div>""", unsafe_allow_html=True)
+        with st.expander("Détails de l'erreur"):
+            import traceback
+            st.code(traceback.format_exc())
+
+    finally:
+        # Nettoyage
+        for f in [tmp_path, tmp_path.replace(".pdf", ".xlsx")]:
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
+
+else:
+    # État vide
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="text-align:center; padding: 3rem; color: #888; border: 2px dashed #BDD7EE; border-radius: 12px; background: #f8fafd;">
+        <div style="font-size: 3rem;">📄</div>
+        <h3 style="color: #2E75B6;">Importez un PDF pour commencer</h3>
+        <p>Pièces annexes à la déclaration IS — Modèle Comptable Normal</p>
+    </div>
+    """, unsafe_allow_html=True)
