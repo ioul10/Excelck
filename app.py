@@ -1,23 +1,22 @@
 """
-FiscalXL — Convertisseur PDF Fiscal → Excel Pro
-Point d'entrée Streamlit
+FiscalXL v2 — PDF Fiscal → Excel Pro
+Nouvelle approche : injection dans template (formules déjà présentes)
 """
 
 import streamlit as st
-import tempfile
-import os
+import tempfile, os
 from pathlib import Path
+import pandas as pd
 
-from core.extractor import PDFExtractor
-from core.transformer import FiscalTransformer
-from core.excel_builder import ExcelBuilder
-from core.template_filler import TemplateFiller  # ← AJOUTÉ : Import du TemplateFiller
-from utils.validator import validate_pdf_structure
+from core.pdf_parser import PDFParser
+from core.injector import TemplateInjector
+from utils.validator import validate_pdf_structure_v2
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Config page ──────────────────────────────────────────────────────────────
+TEMPLATE_PATH = Path(__file__).parent / "template_fiscal.xlsx"
+
 st.set_page_config(
     page_title="FiscalXL — PDF → Excel",
     page_icon="📊",
@@ -25,327 +24,220 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS personnalisé ─────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main-header {
-        background: linear-gradient(135deg, #1F3864 0%, #2E75B6 100%);
-        padding: 2rem 2.5rem;
-        border-radius: 12px;
-        margin-bottom: 2rem;
-        color: white;
-    }
-    .main-header h1 { color: white; margin: 0; font-size: 2.2rem; }
-    .main-header p  { color: #BDD7EE; margin: 0.3rem 0 0; font-size: 1rem; }
-
-    .step-card {
-        background: #f8f9fa;
-        border-left: 4px solid #2E75B6;
-        padding: 1rem 1.2rem;
-        border-radius: 0 8px 8px 0;
-        margin: 0.5rem 0;
-    }
-    .step-card h4 { margin: 0 0 0.3rem; color: #1F3864; }
-    .step-card p  { margin: 0; color: #555; font-size: 0.9rem; }
-
-    .stat-box {
-        background: white;
-        border: 1px solid #BDD7EE;
-        border-radius: 8px;
-        padding: 1rem;
-        text-align: center;
-    }
-    .stat-box .value { font-size: 1.6rem; font-weight: bold; color: #1F3864; }
-    .stat-box .label { font-size: 0.8rem; color: #888; margin-top: 0.2rem; }
-
-    .success-banner {
-        background: #E2EFDA;
-        border: 1px solid #70AD47;
-        border-radius: 8px;
-        padding: 1rem 1.5rem;
-        color: #375623;
-    }
-    .error-banner {
-        background: #FCE4D6;
-        border: 1px solid #C55A11;
-        border-radius: 8px;
-        padding: 1rem 1.5rem;
-        color: #7B2C00;
-    }
-    [data-testid="stFileUploader"] { border: 2px dashed #2E75B6 !important; border-radius: 10px; }
-    div[data-testid="stDownloadButton"] button {
-        background: linear-gradient(135deg, #1F3864, #2E75B6);
-        color: white;
-        border: none;
-        padding: 0.7rem 2rem;
-        font-size: 1rem;
-        border-radius: 8px;
-        width: 100%;
-    }
+.main-header {
+    background: linear-gradient(135deg, #1F3864 0%, #2E75B6 100%);
+    padding: 2rem 2.5rem; border-radius: 12px; margin-bottom: 1.5rem;
+}
+.main-header h1 { color: white; margin: 0; font-size: 2rem; }
+.main-header p  { color: #BDD7EE; margin: 0.4rem 0 0; font-size: 0.95rem; }
+.step-card {
+    background: #f8f9fa; border-left: 4px solid #2E75B6;
+    padding: 0.8rem 1rem; border-radius: 0 8px 8px 0; margin: 0.4rem 0;
+}
+.step-card strong { color: #1F3864; }
+.step-card span   { color: #555; font-size: 0.88rem; }
+.kpi-box {
+    background: white; border: 1px solid #BDD7EE;
+    border-radius: 8px; padding: 0.8rem; text-align: center;
+}
+.kpi-box .val { font-size: 1.3rem; font-weight: bold; color: #1F3864; }
+.kpi-box .lbl { font-size: 0.75rem; color: #888; margin-top: 0.2rem; }
+.success-box { background:#E2EFDA; border:1px solid #70AD47; border-radius:8px; padding:1rem 1.5rem; color:#375623; }
+.warn-box    { background:#FFF2CC; border:1px solid #FFD700; border-radius:8px; padding:0.8rem 1.2rem; color:#7B5900; }
+.error-box   { background:#FCE4D6; border:1px solid #C55A11; border-radius:8px; padding:1rem 1.5rem; color:#7B2C00; }
+div[data-testid="stDownloadButton"] button {
+    background: linear-gradient(135deg, #1F3864, #2E75B6);
+    color:white; border:none; padding:0.8rem 2.5rem;
+    font-size:1.05rem; border-radius:8px; width:100%;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="main-header">
     <h1>📊 FiscalXL</h1>
-    <p>Convertisseur automatique · Pièces annexes Déclaration IS → Excel structuré avec formules</p>
+    <p>Convertisseur PDF → Excel · Pièces annexes IS (Modèle Comptable Normal, loi 9-88)</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://img.icons8.com/color/96/microsoft-excel-2019.png", width=60)
-    
     st.markdown("### ⚙️ Options")
-    
-    # Mode de génération
-    generation_mode = st.radio(
-        "Mode de génération",
-        ["Excel avec formules (nouveau)", "Remplir template existant"],
-        help="Choisis entre créer un nouvel Excel ou remplir ton template"
-    )
-    
-    if generation_mode == "Remplir template existant":
-        template_file = st.file_uploader(
-            "📁 Template Excel",
-            type=["xlsx"],
-            help="Ton fichier Excel template à remplir"
-        )
-    
-    opt_dashboard = st.toggle("Feuille Tableau de Bord", value=True)
-    opt_formulas  = st.toggle("Formules dynamiques",     value=True)
-    opt_colors    = st.toggle("Mise en forme colorée",   value=True)
-
+    show_preview = st.toggle("Aperçu des données", value=True)
+    show_debug   = st.toggle("Mode débogage",      value=False)
     st.markdown("---")
-    st.markdown("### 📋 Structure détectée")
-    st.markdown("""
-    Le PDF doit contenir :
-    - **Page 1** — Infos générales
-    - **Page 2-3** — Bilan Actif
-    - **Page 3-4** — Bilan Passif
-    - **Page 4-5** — CPC
-    """)
-
+    st.markdown("### 📋 Format PDF attendu")
+    st.markdown("- **Page 1** — Infos générales\n- **Page 2** — Bilan Actif (immobilisé)\n- **Page 3** — Bilan Actif (circulant)\n- **Page 4** — Bilan Passif\n- **Page 5** — CPC")
     st.markdown("---")
-    st.markdown("### ℹ️ À propos")
-    st.caption("FiscalXL v1.0 · Modèle Comptable Normal (loi 9-88)")
+    if not TEMPLATE_PATH.exists():
+        st.error("⚠️ Template introuvable")
+    else:
+        st.success("✅ Template chargé")
+    st.caption("FiscalXL v2 · MCN loi 9-88")
 
-# ── Layout principal ─────────────────────────────────────────────────────────
-col_upload, col_info = st.columns([3, 2])
-
-with col_upload:
+col_up, col_steps = st.columns([3, 2])
+with col_up:
     st.markdown("### 📂 Importer le PDF")
-    uploaded = st.file_uploader(
-        "Glissez-déposez ou cliquez pour choisir",
-        type=["pdf"],
-        help="PDF de pièces annexes à la déclaration IS (Modèle Normal)",
-    )
+    uploaded = st.file_uploader("Glissez-déposez ou cliquez", type=["pdf"])
 
-with col_info:
-    st.markdown("### 🔄 Étapes de traitement")
-    steps = [
-        ("1 · Extraction",   "Lecture du PDF avec pdfplumber"),
-        ("2 · Structuration","Détection des tableaux et des zones"),
-        ("3 · Relations",    "Reconstruction des formules & totaux"),
-        ("4 · Excel Pro",    "Génération du classeur multi-feuilles"),
-    ]
-    for title, desc in steps:
-        st.markdown(f"""
-        <div class="step-card">
-            <h4>{title}</h4>
-            <p>{desc}</p>
-        </div>""", unsafe_allow_html=True)
+with col_steps:
+    st.markdown("### 🔄 Pipeline")
+    for step, desc in [
+        ("1 · Lecture PDF",         "pdfplumber extrait tableaux et texte"),
+        ("2 · Parsing valeurs",     "Chaque nombre aligné sur son label"),
+        ("3 · Injection template",  "Valeurs → cellules exactes du modèle"),
+        ("4 · Excel avec formules", "Totaux et résultats calculés auto"),
+    ]:
+        st.markdown(f'<div class="step-card"><strong>{step}</strong><br><span>{desc}</span></div>', unsafe_allow_html=True)
 
-# ── Traitement ───────────────────────────────────────────────────────────────
 if uploaded:
     st.markdown("---")
 
-    # Sauvegarder temporairement le PDF
+    if not TEMPLATE_PATH.exists():
+        st.markdown('<div class="error-box">❌ <strong>Template manquant.</strong></div>', unsafe_allow_html=True)
+        st.stop()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded.getbuffer())
-        tmp_path = tmp.name
-
-    template_tmp_path = None  # Pour le cleanup du template
+        pdf_path = tmp.name
+    output_path = pdf_path.replace(".pdf", "_out.xlsx")
 
     try:
-        # ── Progression ──
-        progress = st.progress(0, text="Initialisation...")
+        progress = st.progress(0)
         status   = st.empty()
 
-        # Étape 1 : Validation
-        status.info("🔍 **Étape 1/4** — Validation de la structure PDF...")
-        progress.progress(10, text="Validation structure...")
-
-        with st.spinner("Lecture du PDF..."):
-            extractor = PDFExtractor(tmp_path)
-            validation = validate_pdf_structure(extractor)
-
+        # Étape 1
+        status.info("🔍 Étape 1/4 — Validation du PDF...")
+        progress.progress(10)
+        parser = PDFParser(pdf_path)
+        validation = validate_pdf_structure_v2(parser)
         if not validation["valid"]:
-            st.markdown(f"""
-            <div class="error-banner">
-                ⚠️ <strong>Structure non reconnue</strong><br>
-                {validation['message']}
-            </div>""", unsafe_allow_html=True)
+            st.markdown(f'<div class="error-box">⚠️ {validation["message"]}</div>', unsafe_allow_html=True)
             st.stop()
 
-        progress.progress(25, text="Structure validée ✓")
-
-        # Afficher méta-données détectées
         meta = validation["meta"]
         c1, c2, c3, c4 = st.columns(4)
-        for col, (label, val) in zip(
-            [c1, c2, c3, c4],
-            [("Raison Sociale", meta.get("raison_sociale", "—")[:22]),
-             ("Identifiant Fiscal", meta.get("identifiant_fiscal", "—")),
-             ("Exercice", meta.get("exercice", "—")),
-             ("Pages détectées", str(meta.get("pages", "—")))]):
-            col.markdown(f"""
-            <div class="stat-box">
-                <div class="value">{val}</div>
-                <div class="label">{label}</div>
-            </div>""", unsafe_allow_html=True)
+        for col, (lbl, val) in zip([c1,c2,c3,c4], [
+            ("Raison Sociale",    (meta.get("raison_sociale") or "—")[:22]),
+            ("Identifiant Fiscal", meta.get("identifiant_fiscal") or "—"),
+            ("Fin exercice",      meta.get("exercice_fin") or "—"),
+            ("Pages",             str(meta.get("pages","—"))),
+        ]):
+            col.markdown(f'<div class="kpi-box"><div class="val">{val}</div><div class="lbl">{lbl}</div></div>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
+        progress.progress(20)
 
-        # Étape 2 : Extraction
-        status.info("📄 **Étape 2/4** — Extraction des données...")
-        progress.progress(40, text="Extraction des tableaux...")
+        # Étape 2
+        status.info("📄 Étape 2/4 — Extraction des valeurs PDF...")
+        progress.progress(40)
+        with st.spinner("Parsing..."):
+            extracted = parser.parse()
+        progress.progress(60)
 
-        with st.spinner("Extraction en cours..."):
-            data = extractor.extract_all()
+        if show_debug:
+            with st.expander("🐛 Données brutes extraites"):
+                st.json({k: {str(lbl): v for lbl,v in d.items()} if isinstance(d, dict) else d
+                         for k,d in extracted.items()})
 
-        progress.progress(60, text="Extraction complète ✓")
+        # Étape 3
+        status.info("🔗 Étape 3/4 — Injection dans le template...")
+        progress.progress(70)
+        with st.spinner("Injection..."):
+            injector = TemplateInjector(str(TEMPLATE_PATH))
+            stats = injector.inject(extracted, output_path)
+        progress.progress(88)
 
-        # Étape 3 : Transformation
-        status.info("🔗 **Étape 3/4** — Reconstruction des relations...")
-        progress.progress(70, text="Calcul des relations...")
-
-        with st.spinner("Structuration des données..."):
-            transformer = FiscalTransformer(data)
-            fiscal_data = transformer.transform()
-
-        progress.progress(80, text="Relations reconstruites ✓")
-
-        # Étape 4 : Excel
-        status.info("📊 **Étape 4/4** — Génération du fichier Excel...")
-        progress.progress(88, text="Génération Excel...")
-
-        output_path = tmp_path.replace(".pdf", ".xlsx")
-        stats = {}  # ← Initialisation pour éviter l'erreur UnboundLocalError
-
-        with st.spinner("Construction du classeur Excel..."):
-            if generation_mode == "Excel avec formules (nouveau)":
-                # Mode actuel : création from scratch
-                builder = ExcelBuilder(
-                    fiscal_data,
-                    with_dashboard=opt_dashboard,
-                    with_formulas=opt_formulas,
-                    with_colors=opt_colors,
-                )
-                stats = builder.build(output_path)
-            else:
-                # NOUVEAU : Remplir template existant
-                if template_file:
-                    # Sauvegarder temporairement le template
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_tpl:
-                        tmp_tpl.write(template_file.getbuffer())
-                        template_tmp_path = tmp_tpl.name
-                    
-                    filler = TemplateFiller(template_tmp_path)
-                    stats = filler.fill_from_data(fiscal_data, output_path)
-                else:
-                    st.error("⚠️ Veuillez uploader un template Excel pour utiliser ce mode")
-                    st.stop()
-
-        progress.progress(100, text="✅ Terminé !")
+        # Étape 4
+        status.info("✅ Étape 4/4 — Vérification...")
+        import openpyxl
+        wb_check = openpyxl.load_workbook(output_path)
+        n_formulas = sum(
+            1 for ws in wb_check.worksheets
+            for row in ws.iter_rows()
+            for c in row
+            if isinstance(c.value, str) and c.value.startswith("=")
+        )
+        progress.progress(100)
         status.empty()
 
-        # ── Succès ──
         st.markdown(f"""
-        <div class="success-banner">
-            ✅ <strong>Fichier Excel généré avec succès !</strong>
-            &nbsp;·&nbsp; {stats.get('sheets', '—')} feuilles
-            &nbsp;·&nbsp; {stats.get('formulas', '—')} formules
-            &nbsp;·&nbsp; {stats.get('rows', '—')} lignes de données
+        <div class="success-box">
+            ✅ <strong>Fichier Excel généré !</strong>
+            &nbsp;·&nbsp; {len(wb_check.sheetnames)} feuilles
+            &nbsp;·&nbsp; {n_formulas} formules intactes
+            &nbsp;·&nbsp; {stats['injected']} valeurs injectées
         </div>""", unsafe_allow_html=True)
+
+        if stats.get("not_found"):
+            nf = stats["not_found"]
+            st.markdown(f'<div class="warn-box">⚠️ <strong>{len(nf)} postes non mappés</strong> : {" · ".join(nf[:6])}</div>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Prévisualisation ──
-        with st.expander("👁️ Aperçu des données extraites", expanded=False):
-            tabs = st.tabs(["Infos", "Bilan Actif", "Bilan Passif", "CPC"])
+        if show_preview:
+            with st.expander("👁️ Aperçu des valeurs extraites", expanded=True):
+                tabs = st.tabs(["ℹ️ Infos", "📋 Bilan Actif", "📋 Bilan Passif", "📈 CPC"])
 
-            with tabs[0]:
-                st.json(fiscal_data.get("info", {}))
+                with tabs[0]:
+                    for k, v in extracted.get("info", {}).items():
+                        if k != "pages":
+                            st.markdown(f"**{k.replace('_',' ').title()}** : {v}")
 
-            with tabs[1]:
-                actif = fiscal_data.get("bilan_actif", [])
-                if actif:
-                    import pandas as pd
-                    df = pd.DataFrame(actif,
-                        columns=["Poste", "Brut", "Amort.", "Net N", "Net N-1"])
-                    st.dataframe(df, use_container_width=True)
+                with tabs[1]:
+                    av = extracted.get("actif_values", {})
+                    if av:
+                        df = pd.DataFrame(
+                            [(k, *(f"{x:.2f}" if x is not None else "—" for x in (v+[None,None,None])[:3]))
+                             for k, v in av.items()],
+                            columns=["Poste","Brut","Amort.","Net N-1"])
+                        st.dataframe(df, use_container_width=True, height=300)
 
-            with tabs[2]:
-                passif = fiscal_data.get("bilan_passif", [])
-                if passif:
-                    import pandas as pd
-                    df = pd.DataFrame(passif, columns=["Poste", "Exercice N", "Exercice N-1"])
-                    st.dataframe(df, use_container_width=True)
+                with tabs[2]:
+                    pv = extracted.get("passif_values", {})
+                    if pv:
+                        df = pd.DataFrame(
+                            [(k, *(f"{x:.2f}" if x is not None else "—" for x in (v+[None,None])[:2]))
+                             for k, v in pv.items()],
+                            columns=["Poste","Exercice N","Exercice N-1"])
+                        st.dataframe(df, use_container_width=True, height=300)
 
-            with tabs[3]:
-                cpc = fiscal_data.get("cpc", [])
-                if cpc:
-                    import pandas as pd
-                    df = pd.DataFrame(cpc,
-                        columns=["Désignation", "Propre N", "Exerc. Préc.", "Total N", "Total N-1"])
-                    st.dataframe(df, use_container_width=True)
+                with tabs[3]:
+                    cv = extracted.get("cpc_values", {})
+                    if cv:
+                        df = pd.DataFrame(
+                            [(k, *(f"{x:.2f}" if x is not None else "—" for x in (v+[None,None,None])[:3]))
+                             for k, v in cv.items()],
+                            columns=["Désignation","Propre N","Exerc. Préc.","Total N-1"])
+                        st.dataframe(df, use_container_width=True, height=300)
 
-        # ── Bouton de téléchargement ──
         st.markdown("### ⬇️ Télécharger")
         fname = Path(uploaded.name).stem + "_fiscal.xlsx"
         with open(output_path, "rb") as f:
             st.download_button(
-                label="📥 Télécharger le fichier Excel",
-                data=f,
-                file_name=fname,
+                "📥 Télécharger le fichier Excel",
+                data=f, file_name=fname,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
     except Exception as e:
-        logger.exception("Erreur lors du traitement")
-        st.markdown(f"""
-        <div class="error-banner">
-            ❌ <strong>Erreur de traitement</strong><br>
-            <code>{str(e)}</code>
-        </div>""", unsafe_allow_html=True)
-        with st.expander("Détails de l'erreur"):
-            import traceback
-            st.code(traceback.format_exc())
-
+        logger.exception("Erreur pipeline")
+        st.markdown(f'<div class="error-box">❌ <strong>Erreur :</strong> <code>{e}</code></div>', unsafe_allow_html=True)
+        if show_debug:
+            import traceback; st.code(traceback.format_exc())
     finally:
-        # Nettoyage des fichiers temporaires
-        for f in [tmp_path, tmp_path.replace(".pdf", ".xlsx")]:
-            if os.path.exists(f):
-                try:
-                    os.unlink(f)
-                except Exception:
-                    pass
-        # Cleanup du template temporaire
-        if template_tmp_path and os.path.exists(template_tmp_path):
+        for f in [pdf_path, output_path]:
             try:
-                os.unlink(template_tmp_path)
+                if os.path.exists(f): os.unlink(f)
             except Exception:
                 pass
 
 else:
-    # État vide
-    st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("""
-    <div style="text-align:center; padding: 3rem; color: #888; border: 2px dashed #BDD7EE; border-radius: 12px; background: #f8fafd;">
-        <div style="font-size: 3rem;">📄</div>
-        <h3 style="color: #2E75B6;">Importez un PDF pour commencer</h3>
+    <div style="text-align:center;padding:3rem;color:#888;
+        border:2px dashed #BDD7EE;border-radius:12px;background:#f8fafd;margin-top:1rem;">
+        <div style="font-size:3rem;">📄</div>
+        <h3 style="color:#2E75B6;">Importez un PDF pour commencer</h3>
         <p>Pièces annexes à la déclaration IS — Modèle Comptable Normal</p>
-    </div>
-    """, unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
