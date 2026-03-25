@@ -4,3 +4,5 @@ backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F0F4FA"
 textColor = "#1F3864"
 font = "sans serif"
+[logger]
+level = "debug"
