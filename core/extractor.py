@@ -1,7 +1,7 @@
 """
 core/extractor.py
 Étape 1 & 2 : Extraction PDF → données brutes structurées
-Version améliorée avec extraction par tableaux + texte
+Version corrigée : extraction par tableaux avec mapping de colonnes
 """
 import re
 import pdfplumber
@@ -12,10 +12,10 @@ logger = get_logger(__name__)
 class PDFExtractor:
     """
     Lit un PDF de pièces annexes IS (Modèle Normal) et extrait :
-    - Infos générales (page 1)
-    - Bilan Actif     (pages 2-3)
-    - Bilan Passif    (pages 3-4)
-    - CPC             (pages 4-5)
+    - Infos générales (page 1) : tableau 2 colonnes
+    - Bilan Actif     (pages 2-3) : tableau 5 colonnes
+    - Bilan Passif    (page 4)    : tableau 3 colonnes  
+    - CPC             (page 5)    : tableau 5 colonnes
     """
     
     def __init__(self, pdf_path: str):
@@ -44,356 +44,295 @@ class PDFExtractor:
     
     # ── Infos générales ───────────────────────────────────────────────────────
     def _extract_info(self) -> dict:
-        text = self.get_raw_text(0)
-        info = {}
-        
-        patterns = {
-            "raison_sociale":       r"Raison sociale\s*[:\-]?\s*(.+?)(?:\n|Taxe|$)",
-            "taxe_professionnelle": r"Taxe professionnelle\s*[:\-]?\s*(\d+)",
-            "identifiant_fiscal":   r"Identifiant fiscal\s*[:\-]?\s*(\d+)",
-            "adresse":              r"Adresse\s*[:\-]?\s*(.+?)(?:\n|$)",
-            "date_declaration":     r"(?:FES|FÈS|RABAT|CASABLANCA)\s+[Ll]e\s+(\d{2}/\d{2}/\d{4})",
+        """Extraction depuis le tableau page 1 : Champ | Valeur"""
+        info = {
+            "raison_sociale": "",
+            "taxe_professionnelle": "",
+            "identifiant_fiscal": "",
+            "adresse": "",
+            "exercice": "",
+            "date_declaration": "",
+            "pages": self.num_pages
         }
         
-        for key, pattern in patterns.items():
-            m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            if m:
-                info[key] = m.group(1).strip()
-            else:
-                info[key] = ""
+        # Mapping des champs attendus
+        field_mapping = {
+            "raison sociale": "raison_sociale",
+            "taxe professionnelle": "taxe_professionnelle", 
+            "identifiant fiscal": "identifiant_fiscal",
+            "adresse": "adresse",
+            "exercice": "exercice",
+            "date de déclaration": "date_declaration",
+            "date de declaration": "date_declaration",  # sans accent fallback
+        }
         
-        # Exercice : chercher sur la 2e page si pas trouvé
-        for page_idx in range(min(3, self.num_pages)):
-            t = self.get_raw_text(page_idx)
+        # Extraire depuis les tableaux de la page 1 (et 2 si besoin)
+        for page_idx in range(min(2, self.num_pages)):
+            tables = self.pages[page_idx].extract_tables()
+            
+            for table in tables:
+                if not table:
+                    continue
+                    
+                for row in table:
+                    if not row or len(row) < 2:
+                        continue
+                    
+                    # Nettoyer les cellules
+                    label = self._clean_cell(row[0]).lower()
+                    value = self._clean_cell(row[1])
+                    
+                    # Matching avec le mapping
+                    for key_phrase, field_name in field_mapping.items():
+                        if key_phrase in label and not info.get(field_name):
+                            # Nettoyer la valeur
+                            if value and value not in ["", "-", "None", "—"]:
+                                info[field_name] = value.strip()
+                            break
+        
+        # Fallback : chercher l'exercice dans le texte si pas trouvé en tableau
+        if not info["exercice"]:
+            text = self.get_all_text()
             m = re.search(
-                r"[Ee]xercice\s+du\s+(\d{2}/\d{2}/\d{4})\s+au\s+(\d{2}/\d{2}/\d{4})", 
-                t
+                r"[Ee]xercice\s+(?:du\s+)?(\d{2}/\d{2}/\d{4})\s+(?:au|–|—)\s*(\d{2}/\d{2}/\d{4})?",
+                text
             )
             if m:
-                info["exercice_debut"] = m.group(1)
-                info["exercice_fin"]   = m.group(2)
-                info["exercice"]       = f"Du {m.group(1)} au {m.group(2)}"
-                break
+                if m.group(2):
+                    info["exercice"] = f"Du {m.group(1)} au {m.group(2)}"
+                else:
+                    info["exercice"] = m.group(1)
         
-        if not info.get("exercice"):
-            info["exercice"] = ""
-        
-        # Raison sociale : parfois sur la 2e page
-        if not info.get("raison_sociale"):
-            for page_idx in range(1, min(3, self.num_pages)):
-                t = self.get_raw_text(page_idx)
-                m = re.search(r"(?:AGENCE|SOCIETE|SOCIÉTÉ|ENTREPRISE)[^\n]{3,80}", t)
-                if m:
-                    info["raison_sociale"] = m.group(0).strip()
-                    break
-        
-        info["pages"] = self.num_pages
+        logger.info(f"Infos extraites: {info}")
         return info
     
     # ── Bilan Actif ───────────────────────────────────────────────────────────
     def _extract_bilan_actif(self) -> list:
         """
-        Retourne une liste de tuples :
-        (label, brut, amortissements, net_n, net_n1)
+        Extrait le Bilan Actif (pages 2-3)
+        Structure: [Label, Brut N, Amort/Prov, Net N, Net N-1]
+        Retourne: list de tuples (label, brut, amort, net_n, net_n1)
         """
         rows = []
         
-        # Le bilan actif est généralement sur la page 2 (index 1)
-        for page_idx in range(1, min(4, self.num_pages)):
-            # Essayer d'abord l'extraction par tableaux
+        for page_idx in range(1, min(4, self.num_pages)):  # pages 2, 3, 4 (index 1,2,3)
             tables = self.pages[page_idx].extract_tables()
             
-            if tables:
-                for table in tables:
-                    page_rows = self._parse_table_to_rows(table, type="actif")
+            for table in tables:
+                page_rows = self._parse_fiscal_table(table, type="actif")
+                if page_rows:
                     rows.extend(page_rows)
-            
-            # Si pas de tableaux, utiliser le texte
-            if not rows:
-                text = self.get_raw_text(page_idx)
-                if self._is_bilan_actif_page(text):
-                    page_rows = self._parse_bilan_actif_page(text)
-                    rows.extend(page_rows)
+                    break  # Un seul tableau par page pour le bilan
         
-        # Dédoublonner les totaux si spread sur 2 pages
         rows = self._deduplicate(rows)
         logger.info(f"Bilan Actif : {len(rows)} lignes extraites")
         return rows
     
     def _is_bilan_actif_page(self, text: str) -> bool:
-        keywords = ["Immobilisations", "ACTIF", "Stocks", "Créances", "Trésorerie"]
-        return sum(1 for k in keywords if k in text) >= 3
-    
-    def _parse_bilan_actif_page(self, text: str) -> list:
-        """Parse ligne par ligne le texte du bilan actif."""
-        rows = []
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        
-        for line in lines:
-            # Ignorer en-têtes
-            if any(h in line for h in [
-                "Brut", "Amortissements", "EXERCICE", "Tableau", "Bilan",
-                "identifiant", "Exercice du", "ACTIF", "NET"
-            ]):
-                continue
-            
-            label, nums = self._split_label_nums(line)
-            if not label:
-                continue
-            
-            # Normaliser
-            label = self._normalize_label(label)
-            
-            # Filtrer les lignes trop courtes ou sans chiffres
-            if len(label) < 3 and not nums:
-                continue
-            
-            brut = nums[0] if len(nums) > 0 else None
-            amort = nums[1] if len(nums) > 1 else None
-            net_n = nums[2] if len(nums) > 2 else None
-            net_n1 = nums[3] if len(nums) > 3 else None
-            
-            rows.append((label, brut, amort, net_n, net_n1))
-        
-        return rows
+        keywords = ["ACTIF", "Immobilisations", "Stocks", "Créances", "Trésorerie"]
+        return sum(1 for k in keywords if k.upper() in text.upper()) >= 2
     
     # ── Bilan Passif ──────────────────────────────────────────────────────────
     def _extract_bilan_passif(self) -> list:
+        """
+        Extrait le Bilan Passif (page 4)
+        Structure: [Label, Exercice N, Exercice N-1]
+        Retourne: list de tuples (label, val_n, val_n1)
+        """
         rows = []
         
-        for page_idx in range(2, min(5, self.num_pages)):
-            # Essayer tableaux d'abord
+        for page_idx in range(2, min(5, self.num_pages)):  # pages 3, 4, 5
             tables = self.pages[page_idx].extract_tables()
             
-            if tables:
-                for table in tables:
-                    page_rows = self._parse_table_to_rows(table, type="passif")
+            for table in tables:
+                page_rows = self._parse_fiscal_table(table, type="passif")
+                if page_rows:
                     rows.extend(page_rows)
-            
-            # Fallback texte
-            if not rows:
-                text = self.get_raw_text(page_idx)
-                if self._is_bilan_passif_page(text):
-                    rows.extend(self._parse_bilan_passif_page(text))
+                    break
         
         rows = self._deduplicate(rows)
         logger.info(f"Bilan Passif : {len(rows)} lignes extraites")
         return rows
     
     def _is_bilan_passif_page(self, text: str) -> bool:
-        keywords = ["PASSIF", "Capitaux propres", "Capital", "Dettes", "Subvention"]
-        return sum(1 for k in keywords if k in text) >= 3
-    
-    def _parse_bilan_passif_page(self, text: str) -> list:
-        rows = []
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        
-        for line in lines:
-            if any(h in line for h in [
-                "PASSIF", "EXERCICE", "Tableau", "Bilan", "identifiant", 
-                "Exercice du", "(1)Capital", "(2)Bénéficiaire"
-            ]):
-                continue
-            
-            label, nums = self._split_label_nums(line)
-            if not label:
-                continue
-            
-            label = self._normalize_label(label)
-            val_n  = nums[0] if len(nums) > 0 else None
-            val_n1 = nums[1] if len(nums) > 1 else None
-            
-            rows.append((label, val_n, val_n1))
-        
-        return rows
+        keywords = ["PASSIF", "Capitaux propres", "Dettes", "Subvention"]
+        return sum(1 for k in keywords if k.upper() in text.upper()) >= 2
     
     # ── CPC ───────────────────────────────────────────────────────────────────
     def _extract_cpc(self) -> list:
+        """
+        Extrait le CPC (page 5)
+        Structure: [Label, Propre N, Exerc Préc, Total N, Total N-1]
+        Retourne: list de tuples (label, propre_n, prec_n, total_n, total_n1)
+        """
         rows = []
         
-        for page_idx in range(3, min(6, self.num_pages)):
-            # Essayer tableaux
+        for page_idx in range(3, min(6, self.num_pages)):  # pages 4, 5, 6
             tables = self.pages[page_idx].extract_tables()
             
-            if tables:
-                for table in tables:
-                    page_rows = self._parse_table_to_rows(table, type="cpc")
+            for table in tables:
+                page_rows = self._parse_fiscal_table(table, type="cpc")
+                if page_rows:
                     rows.extend(page_rows)
-            
-            # Fallback texte
-            if not rows:
-                text = self.get_raw_text(page_idx)
-                if self._is_cpc_page(text):
-                    rows.extend(self._parse_cpc_page(text))
+                    break
         
         rows = self._deduplicate(rows)
         logger.info(f"CPC : {len(rows)} lignes extraites")
         return rows
     
     def _is_cpc_page(self, text: str) -> bool:
-        keywords = ["Produits", "Charges", "EXPLOITATION", "RÉSULTAT", "RESULTAT"]
-        return sum(1 for k in keywords if k in text) >= 3
+        keywords = ["PRODUITS", "CHARGES", "EXPLOITATION", "RÉSULTAT"]
+        return sum(1 for k in keywords if k.upper() in text.upper()) >= 3
     
-    def _parse_cpc_page(self, text: str) -> list:
-        rows = []
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        
-        for line in lines:
-            if any(h in line for h in [
-                "DESIGNATION", "DÉSIGNATION", "Propres à", "Concernant",
-                "TOTAUX", "Tableau", "identifiant", "Exercice du",
-                "1)Variation", "2)Achats"
-            ]):
-                continue
-            
-            label, nums = self._split_label_nums(line)
-            if not label:
-                continue
-            
-            label = self._normalize_label(label)
-            prop_n  = nums[0] if len(nums) > 0 else None
-            prec_n  = nums[1] if len(nums) > 1 else None
-            total_n = nums[2] if len(nums) > 2 else None
-            total_n1= nums[3] if len(nums) > 3 else None
-            
-            rows.append((label, prop_n, prec_n, total_n, total_n1))
-        
-        return rows
-    
-    # ── Nouvelle méthode : Parser les tableaux extraits ───────────────────────
-    def _parse_table_to_rows(self, table: list, type: str = "actif") -> list:
+    # ── NOUVELLE MÉTHODE PRINCIPALE : Parser tableau fiscal ───────────────────
+    def _parse_fiscal_table(self, table: list, type: str) -> list:
         """
-        Parse un tableau extrait par pdfplumber.extract_tables()
-        Retourne une liste de tuples selon le type
+        Parse un tableau fiscal extrait par pdfplumber
+        Gère le mapping des colonnes selon le type de bilan
         """
         rows = []
         
         if not table:
             return rows
         
+        # Définir le nombre de colonnes attendues selon le type
+        col_config = {
+            "actif":  {"label_col": 0, "value_cols": [1, 2, 3, 4], "expected": 5},
+            "passif": {"label_col": 0, "value_cols": [1, 2], "expected": 3},
+            "cpc":    {"label_col": 0, "value_cols": [1, 2, 3, 4], "expected": 5},
+        }
+        
+        config = col_config.get(type)
+        if not config:
+            return rows
+        
+        label_col = config["label_col"]
+        value_cols = config["value_cols"]
+        
         for row_idx, row in enumerate(table):
-            if not row:
+            if not row or len(row) <= label_col:
                 continue
             
-            # Nettoyer les cellules
-            cleaned_row = [self._clean_cell(cell) for cell in row]
+            # Nettoyer la cellule label
+            label = self._clean_cell(row[label_col])
             
-            # Filtrer les lignes d'en-tête
-            if any(h in str(cleaned_row).upper() for h in [
-                "BRUT", "AMORT", "EXERCICE", "NET", "TOTAL", "ACTIF", "PASSIF"
-            ]):
+            # Ignorer les lignes vides, en-têtes et séparateurs
+            if self._should_skip_row(label, type):
                 continue
             
-            # Extraire label et valeurs
-            label = None
+            # Extraire les valeurs numériques des colonnes appropriées
             values = []
-            
-            for cell in cleaned_row:
-                if not cell:
-                    continue
-                
-                # Tester si c'est un nombre
-                num_val = self._parse_number(cell)
-                if num_val is not None:
+            for col_idx in value_cols:
+                if col_idx < len(row):
+                    cell_val = self._clean_cell(row[col_idx])
+                    num_val = self._parse_number(cell_val)
                     values.append(num_val)
-                elif not label and len(cell) > 2:
-                    # C'est probablement le label
-                    label = self._normalize_label(cell)
+                else:
+                    values.append(None)
             
-            if label and values:
-                if type == "actif":
-                    # (label, brut, amort, net_n, net_n1)
-                    while len(values) < 4:
-                        values.append(None)
-                    rows.append((label, *values[:4]))
-                elif type == "passif":
-                    # (label, val_n, val_n1)
-                    while len(values) < 2:
-                        values.append(None)
-                    rows.append((label, *values[:2]))
-                elif type == "cpc":
-                    # (label, propre_n, prec_n, total_n, total_n1)
-                    while len(values) < 4:
-                        values.append(None)
-                    rows.append((label, *values[:4]))
+            # Ajouter la ligne si on a au moins un label valide
+            if label and len(label) >= 2:
+                rows.append((label, *values))
         
         return rows
     
-    def _clean_cell(self, cell) -> str:
-        """Nettoie une cellule de tableau"""
-        if cell is None:
-            return ""
-        return str(cell).strip()
+    def _should_skip_row(self, label: str, type: str) -> bool:
+        """Détermine si une ligne doit être ignorée"""
+        if not label or len(label) < 2:
+            return True
+        
+        label_upper = label.upper()
+        
+        # Mots-clés d'en-tête à ignorer
+        skip_keywords = [
+            "BILAN", "ACTIF", "PASSIF", "CPC", "COMPTE DE PRODUITS",
+            "EXERCICE", "BRUT", "AMORT", "NET", "TOTAL", "DÉSIGNATION",
+            "PROPRE", "PRÉCÉDENTS", "CHARGES", "PRODUITS",
+            "TABLEAU", "PIÈCES ANNEXES", "IMPÔTS", "MODÈLE",
+            "AGENCE DU BASSIN", "IF:", "HORS TAXES"
+        ]
+        
+        if any(kw in label_upper for kw in skip_keywords):
+            return True
+        
+        # Ignorer les lignes qui ne contiennent que des tirets ou symboles
+        if re.match(r'^[\s\-\–—\|\.]+$', label):
+            return True
+        
+        return False
     
     # ── Utilitaires ───────────────────────────────────────────────────────────
-    @staticmethod
-    def _split_label_nums(line: str):
-        """
-        Sépare une ligne en (texte_label, [liste_de_nombres]).
-        Ex: "Terrains  6 100 375,00  6 100 375,00" → ("Terrains", [6100375.0, 6100375.0])
-        """
-        # Regex pour nombres marocains : 1 234 567,89 ou 1234567.89
-        num_pattern = r"-?\d[\d\s]*(?:[,\.]\d{2})?"
-        nums_found = re.findall(num_pattern, line)
+    def _clean_cell(self, cell) -> str:
+        """Nettoie et normalise une cellule de tableau"""
+        if cell is None:
+            return ""
         
-        parsed_nums = []
-        for n in nums_found:
-            v = PDFExtractor._parse_number(n)
-            if v is not None:
-                parsed_nums.append(v)
+        result = str(cell).strip()
         
-        # Le label est ce qui reste quand on retire les nombres
-        label = re.sub(num_pattern, "", line).strip()
-        label = re.sub(r"\s{2,}", " ", label).strip("[]()- \t")
+        # Remplacer les tirets/vides par chaîne vide
+        if result in ["-", "–", "—", ".", "None", "none", ""]:
+            return ""
         
-        # Ignorer les lignes purement numériques sans label
-        if not label or len(label) < 3:
-            return None, []
+        # Nettoyer les espaces multiples
+        result = re.sub(r'\s+', ' ', result)
         
-        return label, parsed_nums
+        return result
     
     @staticmethod
     def _parse_number(s: str):
-        if not s:
+        """Convertit une chaîne en float, gère le format marocain"""
+        if not s or s in ["-", "–", "—", ".", "None", ""]:
             return None
         
-        s = s.strip().replace(" ", "").replace("\xa0", "")
-        # Format marocain : virgule = décimale, espace = milliers
-        s = s.replace(",", ".")
+        # Nettoyer: espaces, NBSP, puis convertir virgule en point
+        cleaned = s.strip().replace(" ", "").replace("\xa0", "").replace(",", ".")
+        
+        # Gérer les parenthèses pour nombres négatifs: (123.45) → -123.45
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
         
         try:
-            v = float(s)
-            return v if abs(v) < 1e12 else None  # sanity check
-        except ValueError:
+            v = float(cleaned)
+            # Sanity check: rejeter les valeurs absurdes
+            return v if abs(v) < 1e15 else None
+        except (ValueError, TypeError):
             return None
     
     @staticmethod
     def _normalize_label(label: str) -> str:
-        """Nettoie et normalise un libellé."""
-        label = label.strip()
-        # Supprimer caractères parasites en début/fin
-        label = re.sub(r"^[:\-\.\|]+", "", label).strip()
-        label = re.sub(r"[:\-\.\|]+$", "", label).strip()
-        # Normaliser espaces
-        label = re.sub(r"\s{2,}", " ", label)
-        return label
+        """Normalise un libellé pour le matching"""
+        if not label:
+            return ""
+        
+        # Supprimer les caractères parasites en début/fin
+        label = re.sub(r'^[\s:\-\.\|\[\]\(\)]+', '', label).strip()
+        label = re.sub(r'[\s:\-\.\|\[\]\(\)]+$', '', label).strip()
+        
+        # Normaliser les espaces multiples
+        label = re.sub(r'\s{2,}', ' ', label)
+        
+        return label.strip()
     
     @staticmethod
     def _deduplicate(rows: list) -> list:
-        """Supprime les doublons consécutifs de même label."""
-        seen = set()
+        """Supprime les doublons en gardant la première occurrence"""
+        seen = {}
         result = []
         
         for row in rows:
-            key = row[0] if row else None
+            if not row:
+                continue
+            key = row[0]  # Le label est la clé
             if key and key not in seen:
-                seen.add(key)
+                seen[key] = True
                 result.append(row)
         
         return result
     
     def __del__(self):
+        """Fermer proprement le PDF"""
         try:
-            self._pdf.close()
+            if hasattr(self, '_pdf') and self._pdf:
+                self._pdf.close()
         except Exception:
             pass
