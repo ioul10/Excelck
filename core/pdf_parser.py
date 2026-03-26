@@ -1,14 +1,11 @@
 """
-core/pdf_parser.py  v2
+core/pdf_parser.py  v3 — dynamique
 Extraction PDF → valeurs structurées via pdfplumber tables.
-
-Structure des colonnes (détectée empiriquement) :
-  Bilan Actif  (page 2) : [latéral, label, brut, vide, amort, net_n, net_n1]  → idx 1,2,4,6
-  Bilan Passif (page 3) : [latéral, label, vide, val_n, val_n1]               → idx 1,3,4
-  CPC          (pages 4-5): [latéral, num, label, propre_n, prec_n, total_n, total_n1] → idx 2,3,4,5,6
+Détection automatique des pages par mots-clés (plus de numéros hardcodés).
 """
 
 import re
+import unicodedata
 import pdfplumber
 from utils.logger import get_logger
 
@@ -31,30 +28,31 @@ SKIP_PREFIXES = (
     "(1)", "(2)", "1)variation", "2)achats",
 )
 
-# Labels de section/total à ne pas injecter (ils sont calculés par formule)
-# Labels dont l'extraction CPC doit être évitée (lignes totales/résultats)
-# ATTENTION : utiliser des patterns qui ne bloquent pas les sous-postes
 TOTAL_SKIP_EXACT = {
     "total i", "total ii", "total iii", "total général", "total general",
     "total des produits", "total des charges",
     "trésorerie-actif", "trésorerie passif", "tresorerie passif",
     "capitaux propres", "dettes du passif circulant",
 }
-# Préfixes exacts qui indiquent un total/résultat (doit être en début de label)
+
 TOTAL_SKIP_PREFIXES = (
     "résultat d'exploitation", "résultat financier", "résultat courant",
     "résultat non courant", "résultat avant impôts",
     "resultat d'exploitation", "resultat financier", "resultat courant",
     "resultat non courant", "resultat avant impots",
-    # "resultat net" retiré intentionnellement : on veut extraire RESULTAT NET (XI-XII)
-    # pour l'injecter dans Bilan Passif > Résultat net de l'exercice
     "total i ", "total ii", "total iii", "total des ", "total général",
     "produits d'exploitation", "charges d'exploitation",
     "charges financières", "charges financieres",
     "produits non courants", "charges non courants",
 )
-# Alias pour compatibilité
 TOTAL_SKIP = TOTAL_SKIP_EXACT
+
+
+def _normalize_text(text: str) -> str:
+    """Normalise le texte : minuscules, sans accents."""
+    text = unicodedata.normalize('NFD', text)
+    text = text.encode('ascii', 'ignore').decode('utf-8')
+    return text.lower()
 
 
 class PDFParser:
@@ -64,9 +62,12 @@ class PDFParser:
         self.pdf     = pdfplumber.open(pdf_path)
         self.pages   = self.pdf.pages
         self.n_pages = len(self.pages)
+        self._ranges = {}
         logger.info(f"PDF chargé : {pdf_path} — {self.n_pages} pages")
 
     def parse(self) -> dict:
+        self._ranges = self._detect_page_ranges()
+        logger.info(f"Pages détectées : {self._ranges}")
         result = {
             "info":          self._parse_info(),
             "actif_values":  self._parse_actif(),
@@ -76,20 +77,64 @@ class PDFParser:
         self._enrich_passif(result)
         return result
 
+    # ── Détection dynamique des pages ────────────────────────────────────────
+
+    def _detect_page_ranges(self) -> dict:
+        """
+        Détecte dynamiquement les pages de chaque section par mots-clés.
+        Robuste aux variations de mise en page entre PDFs.
+        """
+        ranges = {"actif": [], "passif": [], "cpc": []}
+
+        ACTIF_KEYWORDS = [
+            "actif immobilise", "immobilisations incorporelles",
+            "bilan (actif", "bilan actif", "actif immobilisé",
+            "frais preliminaires", "frais préliminaires",
+        ]
+        PASSIF_KEYWORDS = [
+            "capitaux propres", "bilan (passif", "bilan passif",
+            "capital social", "passif circulant", "dettes de financement",
+        ]
+        CPC_KEYWORDS = [
+            "produits exploitation", "charges exploitation",
+            "compte de produits", "ventes de marchandises",
+            "chiffre d affaires", "chiffres d affaires",
+        ]
+
+        for i, page in enumerate(self.pages):
+            raw_text = page.extract_text() or ""
+            text = _normalize_text(raw_text)
+
+            if any(k in text for k in ACTIF_KEYWORDS):
+                ranges["actif"].append(i)
+            if any(k in text for k in PASSIF_KEYWORDS):
+                ranges["passif"].append(i)
+            if any(k in text for k in CPC_KEYWORDS):
+                ranges["cpc"].append(i)
+
+        # Fallback : si aucune page détectée, utiliser les plages classiques
+        if not ranges["actif"]:
+            logger.warning("Actif : détection échouée, fallback pages 1-2")
+            ranges["actif"] = list(range(1, min(3, self.n_pages)))
+        if not ranges["passif"]:
+            logger.warning("Passif : détection échouée, fallback pages 2-4")
+            ranges["passif"] = list(range(2, min(5, self.n_pages)))
+        if not ranges["cpc"]:
+            logger.warning("CPC : détection échouée, fallback pages 3-6")
+            ranges["cpc"] = list(range(3, min(7, self.n_pages)))
+
+        return ranges
+
+    # ── Enrichissement passif ─────────────────────────────────────────────────
+
     def _enrich_passif(self, data: dict):
-        """
-        Complète les valeurs passif manquantes en les inférant depuis d'autres sections.
-        Résultat net de l'exercice : calculé depuis RESULTAT NET (XI-XII) du CPC.
-        """
         pv = data["passif_values"]
         cpc = data["cpc_values"]
 
-        # Résultat net : somme propre_n + prec_n = total_n, total_n1 = net_n1
         rn_key = "Résultat net de l'exercice"
         if rn_key not in pv:
             for k, v in cpc.items():
                 if "RESULTAT NET (XI-XII)" in k or "RESULTAT NET (XI" in k:
-                    # v = [propre_n, prec_n, total_n1]
                     propre = v[0] or 0
                     prec   = v[1] or 0
                     total_n   = round(propre + prec, 2)
@@ -102,7 +147,6 @@ class PDFParser:
 
     def _parse_info(self) -> dict:
         info = {}
-        # Utiliser le tableau structuré page 1
         tables = self.pages[0].extract_tables()
         for table in tables:
             for row in table:
@@ -121,8 +165,7 @@ class PDFParser:
                         if re.match(r"\d{2}/\d{2}/\d{4}", c.strip()):
                             info["date_declaration"] = c.strip()
 
-        # Exercice sur pages 2+
-        for i in range(1, min(3, self.n_pages)):
+        for i in range(1, min(4, self.n_pages)):
             t = self._page_text(i)
             m = re.search(r"(\d{2}/\d{2}/\d{4})\s+au\s+(\d{2}/\d{2}/\d{4})", t)
             if m:
@@ -137,106 +180,172 @@ class PDFParser:
 
     def _find_value_in_row(self, row) -> str:
         cells = [str(c).strip() for c in row if c and str(c).strip()]
-        # Retourner la dernière cellule non vide et non label
         for c in reversed(cells):
             if len(c) > 2 and not any(k in c.lower() for k in ["raison", "taxe", "identifiant", "adresse", ":"]):
                 return c
         return cells[-1] if cells else ""
 
-    # ── Bilan Actif (page 2) ──────────────────────────────────────────────────
-    # Colonnes : [0=latéral, 1=label, 2=brut, 3=vide, 4=amort, 5=net_n, 6=net_n1]
+    # ── Bilan Actif ───────────────────────────────────────────────────────────
 
     def _parse_actif(self) -> dict:
+        """
+        Colonnes attendues (modèle normal) :
+          7+ cols : [latéral, label, brut, vide, amort, net_n, net_n1]
+          5 cols  : [latéral, label, brut, amort, net_n1]
+          4 cols  : [label, brut, amort, net_n1]
+        """
         values = {}
-        for page_idx in range(1, min(3, self.n_pages)):
+        page_indices = self._ranges.get("actif", [])
+
+        for page_idx in page_indices:
+            if page_idx >= self.n_pages:
+                continue
             tables = self.pages[page_idx].extract_tables()
             for table in tables:
                 for row in table:
                     if not row or len(row) < 3:
                         continue
-                    label = self._clean_label(row[1] if len(row) > 1 else row[0])
+
+                    # Déterminer position du label selon nb de colonnes
+                    n = len(row)
+                    label_col = 1 if n >= 5 else 0
+                    label = self._clean_label(row[label_col])
                     if not label or self._should_skip(label):
                         continue
 
-                    # Colonnes : brut=col2, amort=col4, net_n=col5, net_n1=col6
-                    brut   = self._parse_num(row[2] if len(row) > 2 else None)
-                    amort  = self._parse_num(row[4] if len(row) > 4 else None)
-                    net_n1 = self._parse_num(row[6] if len(row) > 6 else None)
+                    # Adapter les indices de colonnes selon n
+                    if n >= 7:
+                        brut   = self._parse_num(row[2])
+                        amort  = self._parse_num(row[4])
+                        net_n1 = self._parse_num(row[6])
+                    elif n == 6:
+                        brut   = self._parse_num(row[2])
+                        amort  = self._parse_num(row[3])
+                        net_n1 = self._parse_num(row[5])
+                    elif n == 5:
+                        brut   = self._parse_num(row[2])
+                        amort  = self._parse_num(row[3])
+                        net_n1 = self._parse_num(row[4])
+                    elif n == 4:
+                        brut   = self._parse_num(row[1])
+                        amort  = self._parse_num(row[2])
+                        net_n1 = self._parse_num(row[3])
+                    else:
+                        continue
 
                     if any(v is not None for v in [brut, amort, net_n1]):
                         if label not in values:
                             values[label] = [brut, amort, net_n1]
 
-        logger.info(f"Actif : {len(values)} postes avec valeurs")
+        logger.info(f"Actif : {len(values)} postes (pages {page_indices})")
         return values
 
-    # ── Bilan Passif (page 3) ─────────────────────────────────────────────────
-    # Colonnes : [0=latéral, 1=label, 2=vide, 3=val_n, 4=val_n1]
+    # ── Bilan Passif ──────────────────────────────────────────────────────────
 
     def _parse_passif(self) -> dict:
+        """
+        Colonnes attendues :
+          5+ cols : [latéral, label, vide, val_n, val_n1]
+          4 cols  : [latéral, label, val_n, val_n1]
+          3 cols  : [label, val_n, val_n1]
+        """
         values = {}
-        for page_idx in range(2, min(4, self.n_pages)):
+        page_indices = self._ranges.get("passif", [])
+
+        for page_idx in page_indices:
+            if page_idx >= self.n_pages:
+                continue
             tables = self.pages[page_idx].extract_tables()
             for table in tables:
                 for row in table:
                     if not row or len(row) < 3:
                         continue
-                    label = self._clean_label(row[1] if len(row) > 1 else row[0])
+
+                    n = len(row)
+                    label_col = 1 if n >= 4 else 0
+                    label = self._clean_label(row[label_col])
                     if not label or self._should_skip(label):
                         continue
 
-                    val_n  = self._parse_num(row[3] if len(row) > 3 else None)
-                    val_n1 = self._parse_num(row[4] if len(row) > 4 else None)
+                    if n >= 5:
+                        val_n  = self._parse_num(row[3])
+                        val_n1 = self._parse_num(row[4])
+                    elif n == 4:
+                        val_n  = self._parse_num(row[2])
+                        val_n1 = self._parse_num(row[3])
+                    elif n == 3:
+                        val_n  = self._parse_num(row[1])
+                        val_n1 = self._parse_num(row[2])
+                    else:
+                        continue
 
                     if any(v is not None for v in [val_n, val_n1]):
                         if label not in values:
                             values[label] = [val_n, val_n1]
 
-        logger.info(f"Passif : {len(values)} postes avec valeurs")
+        logger.info(f"Passif : {len(values)} postes (pages {page_indices})")
         return values
 
-    # ── CPC (pages 4-5) ───────────────────────────────────────────────────────
-    # Colonnes : [0=latéral, 1=num_romain, 2=label, 3=propre_n, 4=prec_n, 5=total_n, 6=total_n1]
+    # ── CPC ───────────────────────────────────────────────────────────────────
 
     def _parse_cpc(self) -> dict:
         """
         Structure des tableaux CPC selon le nombre de colonnes :
           7 cols: [lat, num, label, propre_n, prec_n, total_n, total_n1]
-          8 cols: [lat, num, label, propre_n, VIDE,   prec_n, total_n, total_n1]
-        On prend toujours : propre_n, prec_n, total_n1 (exercice précédent)
+          8 cols: [lat, num, label, propre_n, VIDE, prec_n, total_n, total_n1]
+          6 cols: [num, label, propre_n, prec_n, total_n, total_n1]
+          5 cols: [label, propre_n, prec_n, total_n, total_n1]
         """
         values = {}
-        for page_idx in range(3, min(6, self.n_pages)):
+        page_indices = self._ranges.get("cpc", [])
+
+        for page_idx in page_indices:
+            if page_idx >= self.n_pages:
+                continue
             tables = self.pages[page_idx].extract_tables()
             for table in tables:
                 for row in table:
                     if not row or len(row) < 4:
                         continue
 
-                    label_raw = row[2] if len(row) > 2 else None
-                    label = self._clean_label(label_raw)
+                    n = len(row)
+
+                    # Trouver la colonne label selon n
+                    if n >= 7:
+                        label_col = 2
+                    elif n == 6:
+                        label_col = 1
+                    else:
+                        label_col = 0
+
+                    label = self._clean_label(row[label_col] if len(row) > label_col else None)
                     if not label or self._should_skip(label):
                         continue
 
-                    n = len(row)
                     if n >= 8:
-                        # 8 cols : col 4 vide → prec_n en col 5, total_n1 en col 7
                         propre_n = self._parse_num(row[3])
                         prec_n   = self._parse_num(row[5])
                         total_n1 = self._parse_num(row[7])
-                    else:
-                        # 7 cols : propre_n col 3, prec_n col 4, total_n1 col 6
+                    elif n == 7:
                         propre_n = self._parse_num(row[3])
                         prec_n   = self._parse_num(row[4])
-                        total_n1 = self._parse_num(row[6] if n > 6 else None)
+                        total_n1 = self._parse_num(row[6])
+                    elif n == 6:
+                        propre_n = self._parse_num(row[2])
+                        prec_n   = self._parse_num(row[3])
+                        total_n1 = self._parse_num(row[5])
+                    elif n == 5:
+                        propre_n = self._parse_num(row[1])
+                        prec_n   = self._parse_num(row[2])
+                        total_n1 = self._parse_num(row[4])
+                    else:
+                        continue
 
                     if any(v is not None for v in [propre_n, prec_n, total_n1]):
-                        # Mettre à jour si on trouve de meilleures valeurs (prec_n non None)
                         if label not in values:
                             values[label] = [propre_n, prec_n, total_n1]
                         else:
                             existing = values[label]
-                            # Enrichir avec prec_n si manquant
                             if existing[1] is None and prec_n is not None:
                                 values[label] = [
                                     existing[0] if existing[0] is not None else propre_n,
@@ -244,7 +353,7 @@ class PDFParser:
                                     existing[2] if existing[2] is not None else total_n1,
                                 ]
 
-        logger.info(f"CPC : {len(values)} postes avec valeurs")
+        logger.info(f"CPC : {len(values)} postes (pages {page_indices})")
         return values
 
     # ── Utilitaires ───────────────────────────────────────────────────────────
@@ -255,13 +364,10 @@ class PDFParser:
             return True
         if any(l.startswith(p) for p in SKIP_PREFIXES):
             return True
-        # Exact match sur labels de totaux
         if l in TOTAL_SKIP_EXACT:
             return True
-        # Préfixe exact sur résultats/totaux
         if any(l.startswith(p) for p in TOTAL_SKIP_PREFIXES):
             return True
-        # Ignorer les labels trop courts ou purement numériques
         if len(label) < 3:
             return True
         if re.match(r"^\d+$", label):
@@ -274,7 +380,6 @@ class PDFParser:
             return ""
         s = str(s).replace("\n", " ").strip()
         s = re.sub(r"\s{2,}", " ", s)
-        # Enlever numéros romains en début
         s = re.sub(r"^(I{1,3}|IV|V|VI{1,3}|IX|X{1,2})\s+", "", s)
         return s.strip()
 
@@ -285,7 +390,6 @@ class PDFParser:
         s = str(s).strip().replace("\n", "")
         if not s or s in ["-", "—", "", "None"]:
             return None
-        # Négatifs entre parenthèses
         neg = False
         if s.startswith("(") and s.endswith(")"):
             neg = True
@@ -293,7 +397,6 @@ class PDFParser:
         if s.startswith("-"):
             neg = True
             s = s[1:]
-        # Format marocain : espace = milliers, virgule = décimale
         s = s.replace(" ", "").replace("\xa0", "").replace(",", ".")
         try:
             v = float(s)
