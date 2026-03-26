@@ -67,14 +67,8 @@ with st.sidebar:
     show_preview = st.toggle("Aperçu des données", value=True)
     show_debug   = st.toggle("Mode débogage",      value=False)
     st.markdown("---")
-    st.markdown("### 📋 Format PDF accepté")
-    st.markdown(
-        "Le PDF doit contenir :\n"
-        "- **Bilan Actif** (immobilisé + circulant)\n"
-        "- **Bilan Passif** (capitaux propres + dettes)\n"
-        "- **CPC** (Compte de Produits et Charges)\n\n"
-        "Les pages sont détectées **automatiquement**."
-    )
+    st.markdown("### 📋 Format PDF attendu")
+    st.markdown("- **Page 1** — Infos générales\n- **Page 2** — Bilan Actif (immobilisé)\n- **Page 3** — Bilan Actif (circulant)\n- **Page 4** — Bilan Passif\n- **Page 5** — CPC")
     st.markdown("---")
     if not TEMPLATE_PATH.exists():
         st.error("⚠️ Template introuvable")
@@ -91,7 +85,7 @@ with col_steps:
     st.markdown("### 🔄 Pipeline")
     for step, desc in [
         ("1 · Lecture PDF",         "pdfplumber extrait tableaux et texte"),
-        ("2 · Détection sections",  "Pages Actif / Passif / CPC détectées auto"),
+        ("2 · Parsing valeurs",     "Chaque nombre aligné sur son label"),
         ("3 · Injection template",  "Valeurs → cellules exactes du modèle"),
         ("4 · Excel avec formules", "Totaux et résultats calculés auto"),
     ]:
@@ -108,13 +102,12 @@ if uploaded:
         tmp.write(uploaded.getbuffer())
         pdf_path = tmp.name
     output_path = pdf_path.replace(".pdf", "_out.xlsx")
-    excel_bytes = None  # sera rempli avant le finally
 
     try:
         progress = st.progress(0)
         status   = st.empty()
 
-        # Étape 1 — Validation
+        # Étape 1
         status.info("🔍 Étape 1/4 — Validation du PDF...")
         progress.progress(10)
         parser = PDFParser(pdf_path)
@@ -136,22 +129,19 @@ if uploaded:
         st.markdown("<br>", unsafe_allow_html=True)
         progress.progress(20)
 
-        # Étape 2 — Extraction
+        # Étape 2
         status.info("📄 Étape 2/4 — Extraction des valeurs PDF...")
         progress.progress(40)
         with st.spinner("Parsing..."):
             extracted = parser.parse()
         progress.progress(60)
 
-        # Afficher les pages détectées
         if show_debug:
-            with st.expander("🗂️ Pages détectées automatiquement"):
-                st.json(parser._ranges)
             with st.expander("🐛 Données brutes extraites"):
                 st.json({k: {str(lbl): v for lbl,v in d.items()} if isinstance(d, dict) else d
                          for k,d in extracted.items()})
 
-        # Étape 3 — Injection
+        # Étape 3
         status.info("🔗 Étape 3/4 — Injection dans le template...")
         progress.progress(70)
         with st.spinner("Injection..."):
@@ -159,7 +149,7 @@ if uploaded:
             stats = injector.inject(extracted, output_path)
         progress.progress(88)
 
-        # Étape 4 — Vérification + lecture en mémoire
+        # Étape 4
         status.info("✅ Étape 4/4 — Vérification...")
         import openpyxl
         wb_check = openpyxl.load_workbook(output_path)
@@ -170,11 +160,6 @@ if uploaded:
             if isinstance(c.value, str) and c.value.startswith("=")
         )
         progress.progress(100)
-
-        # ── LECTURE EN MÉMOIRE avant suppression ──
-        with open(output_path, "rb") as f:
-            excel_bytes = f.read()
-
         status.empty()
 
         st.markdown(f"""
@@ -229,12 +214,12 @@ if uploaded:
 
         st.markdown("### ⬇️ Télécharger")
         fname = Path(uploaded.name).stem + "_fiscal.xlsx"
-        st.download_button(
-            "📥 Télécharger le fichier Excel",
-            data=excel_bytes,   # bytes en mémoire — pas de file handle
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        with open(output_path, "rb") as f:
+            st.download_button(
+                "📥 Télécharger le fichier Excel",
+                data=f, file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
     except Exception as e:
         logger.exception("Erreur pipeline")
@@ -242,11 +227,9 @@ if uploaded:
         if show_debug:
             import traceback; st.code(traceback.format_exc())
     finally:
-        # Suppression sécurisée des fichiers temporaires
         for f in [pdf_path, output_path]:
             try:
-                if os.path.exists(f):
-                    os.unlink(f)
+                if os.path.exists(f): os.unlink(f)
             except Exception:
                 pass
 
@@ -256,5 +239,5 @@ else:
         border:2px dashed #BDD7EE;border-radius:12px;background:#f8fafd;margin-top:1rem;">
         <div style="font-size:3rem;">📄</div>
         <h3 style="color:#2E75B6;">Importez un PDF pour commencer</h3>
-        <p>Pièces annexes à la déclaration IS — Modèle Comptable Normal · Détection automatique des sections</p>
+        <p>Pièces annexes à la déclaration IS — Modèle Comptable Normal</p>
     </div>""", unsafe_allow_html=True)
