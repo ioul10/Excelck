@@ -133,6 +133,27 @@ CPC_CELL_MAP = {
     "impots benefices":                             {"B":"B53", "C":"C53", "E":"E53"},
 }
 
+# ─── Marqueurs de postes PASSIF uniquement ───────────────────────────────────
+# Si un label extrait dans la section actif contient l'un de ces marqueurs,
+# c'est une contamination de la page passif → skip
+PASSIF_ONLY_MARKERS = {
+    'capitaux propres', 'capital social', 'capital appele',
+    'prime emission', 'ecart reevaluation', 'reserve legale', 'reserves legales',
+    'report nouveau', 'reports nouveau', 'resultat instance',
+    'resultat net exercice', 'resultat net de l exercice',
+    'capitaux propres assimil', 'subventions investissement passif',
+    'subvention d investissement', 'subventions d invertissement',
+    'provisions reglementees', 'dettes financement',
+    'emprunts obligataires', 'provisions durables',
+    'fournisseurs comptes rattaches passif', 'clients crediteurs avances passif',
+    'fournisseurs comptes rattaches',  # 'comptes rattaches' commun avec 'clients'
+    'fournisseurs et comptes rattaches',
+    'organismes sociaux', 'autres creanciers',
+    'comptes regularisation passif', 'autres provisions risques charges',
+    'credits escompte', 'credits tresorerie', 'banques soldes crediteurs',
+    'ecarts conversion passif e', 'ecarts conversion passif circulants',
+}
+
 # ─── Labels de section/total → NE PAS injecter ───────────────────────────────
 # Testés via startswith(norm) pour attraper toutes les variantes
 
@@ -195,18 +216,28 @@ CONTEXT_WORD_RULES = {
 # Labels passif qui ont des alias spéciaux
 PASSIF_LABEL_MAP = {
     # label_normalisé_pdf → clé_dans_PASSIF_CELL_MAP
-    "capital social ou personnel 1":    "capital social",
-    "capital social ou personnel":      "capital social",
-    "resultat net de l exercice":       "resultat net exercice passif",
-    "resultat net de l exercice 2":     "resultat net exercice passif",
-    "subvention d investissement":      "subventions investissement passif",
-    "subventions d investissement":     "subventions investissement passif",
-    "resultat en instance d affectation": "resultat instance affectation",
-    "report a nouveau 2":               "report nouveau",
-    "report a nouveau":                 "report nouveau",
-    "fournisseurs et comptes rattaches": "fournisseurs comptes rattaches passif",
-    "comptes de regularisation passif": "comptes regularisation passif",
+    "capital social ou personnel 1":        "capital social",
+    "capital social ou personnel":          "capital social",
+    "resultat net de l exercice":           "resultat net exercice passif",
+    "resultat net de l exercice 2":         "resultat net exercice passif",
+    "subvention d investissement":          "subventions investissement passif",
+    "subventions d investissement":         "subventions investissement passif",
+    "subventions d invertissement":         "subventions investissement passif",
+    "resultat en instance d affectation":   "resultat instance affectation",
+    "resultats nets en instance d affectation":    "resultat instance affectation",
+    "resultats nets en instance d affectation 2":  "resultat instance affectation",
+    "report a nouveau 2":                   "report nouveau",
+    "reports a nouveau 2":                  "report nouveau",
+    "report a nouveau":                     "report nouveau",
+    "reports a nouveau":                    "report nouveau",
+    "fournisseurs et comptes rattaches":    "fournisseurs comptes rattaches passif",
+    "comptes de regularisation passif":     "comptes regularisation passif",
     "autres provisions pour risques et charges g": "autres provisions risques charges",
+    "autres provisions pour risques et charges":   "autres provisions risques charges",
+    "resultat net de l exercice 2":         "resultat net exercice passif",
+    "prime d emission de fusion d apport":  "prime emission fusion",
+    "reserves legales":                     "reserve legale",
+    "organismes sociaux passif":            "organismes sociaux",
 }
 
 CPC_LABEL_MAP = {
@@ -287,12 +318,14 @@ class TemplateInjector:
                 continue
 
             # ── Filtre anti-contamination actif ──
-            # Dans la section actif : si Brut=None, toujours skip
-            # (Net=Brut-Amort par formule → sans Brut, pas d'injection utile)
             if section == "actif":
                 brut = vals[0] if vals else None
+                # 1) Si le label correspond à un poste passif → toujours skip (contamination)
+                if any(marker in norm for marker in PASSIF_ONLY_MARKERS):
+                    continue
+                # 2) Si Brut=None → pas de valeur actif utile → skip
                 if brut is None:
-                    continue  # skip silencieux, pas de not_found
+                    continue
 
             # ── Résolution du label ──
             key = self._resolve_label(norm, section, idx, cell_map, label_map)
@@ -400,3 +433,79 @@ def find_key_fuzzy(norm: str, index: dict, cell_map: dict,
             best_score = score
             best = k_orig
     return best
+
+# ── ALIAS UNIVERSELS — variantes entre PDFs ───────────────────────────────────
+
+ACTIF_CELL_MAP.update({
+    # Variantes orthographiques PDF2
+    "immobilisations non valeurs":              {"B":"B5",  "C":"C5",  "E":"E5"},
+    "primes remboursement obligations":         {"B":"B8",  "C":"C8",  "E":"E8"},
+    "immobilisation incorporelle":              {"B":"B9",  "C":"C9",  "E":"E9"},
+    "brevet marques droit valeurs":             {"B":"B11", "C":"C11", "E":"E11"},
+    "mobilier materiel bureau amenagement":     {"B":"B19", "C":"C19", "E":"E19"},
+    "immobilisations financieres":              {"B":"B22", "C":"C22", "E":"E22"},
+    "augmentations dettes financement":         {"B":"B29", "C":"C29", "E":"E29"},
+    "banque tg ccp":                            {"B":"B51", "C":"C51", "E":"E51"},
+    "caisses regies avances accreditifs":       {"B":"B52", "C":"C52", "E":"E52"},
+})
+
+PASSIF_CELL_MAP.update({
+    # Variantes PDF2
+    "reserves legales":                         {"B":"B11", "C":"C11"},
+    "reports nouveau":                          {"B":"B13", "C":"C13"},
+    "report nouveau 2":                         {"B":"B13", "C":"C13"},
+    "resultats nets instance affectation":      {"B":"B14", "C":"C14"},
+    "resultats nets en instance affectation 2": {"B":"B14", "C":"C14"},
+    "subventions invertissement":               {"B":"B18", "C":"C18"},
+    "autre dettes financement":                 {"B":"B22", "C":"C22"},
+    "credit tresorerie":                        {"B":"B45", "C":"C45"},
+    "banques soldes crediteurs passif":         {"B":"B46", "C":"C46"},
+    "diminution dettes financement passif":     {"B":"B28", "C":"C28"},
+    # Labels passif qui arrivent aussi depuis actif_values
+    "prime emission fusion apport":             {"B":"B9",  "C":"C9"},
+    "prime d emission de fusion d apport":      {"B":"B9",  "C":"C9"},
+})
+
+CPC_CELL_MAP.update({
+    # Variantes PDF2 — "pour elle-même" tronqué
+    "immobilisations produites entreprise meme": {"B":"B9",  "C":"C9",  "E":"E9"},
+    "immobilisations produites e se":            {"B":"B9",  "C":"C9",  "E":"E9"},
+})
+
+# ── Labels à NE PAS injecter (totaux calculés par formule) ───────────────────
+
+NO_INJECT_STARTSWITH = (
+    # CPC
+    "resultat d exploitation", "resultat financier",
+    "resultat courant", "resultat non courant", "resultat avant impots",
+    "resultat net xi", "resultat net total",
+    # Totaux
+    "total i ", "total ii", "total iii", "total des ", "total general",
+    "total vii", "total viii", "total f g h", "total a b c d e",
+    "total f g h i",
+    # Sections sans cellules
+    "charges non courant", "produits non courant",
+    "produits d exploitation", "charges d exploitation",
+    "charges financier", "produits financier",
+    "capitaux propres assimil", "dettes du passif circulant",
+    "dettes passif circulant",
+    "immobilisations non valeurs",  # sous-total calculé
+    "immobilisation incorporelle",  # sous-total calculé
+    "immobilisations financieres",  # sous-total calculé
+    "stocks",  # sous-total calculé
+    "creances actif circulant",
+    "tresorerie actif", "tresorerie passif",
+    "total des capitaux propres",
+    "capitaux propres assimiles",
+    "provisions durables",
+)
+
+NO_INJECT_EXACT = {
+    "iii", "vii", "total", "xiv total des produits", "xvi resultat net",
+    "dont verse", "capital appele", "total general iii",
+    "total a b c d e", "stocks f", "creances actif circulant g",
+    "total f g h i", "total f g h",
+    "tresorerie actif", "dettes passif circulant",
+    "total general i ii iii",
+    "vii vii resultat courant reports",
+}
