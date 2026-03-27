@@ -7,7 +7,12 @@ import pandas as pd
 import openpyxl
 
 from core.pdf_parser import PDFParser
-from core.dgi_parser  import DGIParser
+try:
+    from core.dgi_parser import DGIParser
+    CAMELOT_OK = True
+except ImportError:
+    CAMELOT_OK = False
+    DGIParser  = None
 from core.injector    import TemplateInjector
 from utils.validator  import validate_pdf_structure_v2
 from utils.logger     import get_logger
@@ -68,6 +73,10 @@ with st.sidebar:
     if is_dgi:
         st.markdown('<span class="badge-dgi">MODE DGI — Camelot Lattice</span>',
                     unsafe_allow_html=True)
+        if not CAMELOT_OK:
+            st.error("⚠️ camelot-py non installé.\n\n"
+                     "Installez-le :\n`pip install camelot-py[cv]`\n"
+                     "et `ghostscript` (système)")
         st.markdown("""
         - **Page 1** — Identification
         - **Pages 2-3** — Bilan Actif
@@ -318,6 +327,17 @@ try:
 
     with st.spinner("Extraction en cours..."):
         if is_dgi:
+            if not CAMELOT_OK:
+                st.markdown(
+                    '<div class="error-box">'
+                    '❌ <strong>camelot-py non installé.</strong><br>'
+                    'Mode DGI nécessite : <code>pip install camelot-py[cv]</code> '
+                    'et <code>ghostscript</code> (apt/brew install ghostscript)<br>'
+                    'Ou utilisez le mode <strong>AMMC</strong> si votre PDF fait 5 pages.'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                st.stop()
             parser = DGIParser(pdf_path)
         else:
             parser = PDFParser(pdf_path)
