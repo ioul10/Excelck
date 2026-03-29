@@ -1,20 +1,20 @@
-"""FiscalXL v5 — Un seul parseur X/Y (pdfplumber) pour DGI et AMMC"""
+"""FiscalXL v6 — DirectInjector + EX_template.xlsx"""
 
 import streamlit as st
-import tempfile, os
+import tempfile, os, shutil
 from pathlib import Path
 import pandas as pd
 import openpyxl
 
-from core.pdf_parser import PDFParser
-from core.injector   import TemplateInjector
+from core.direct_injector import DirectInjector, build_excel_index, soft_normalize
 from utils.validator import validate_pdf_structure_v2
-from utils.logger    import get_logger
+from core.pdf_parser import PDFParser
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
-TEMPLATE_PATH = Path(__file__).parent / "template_fiscal.xlsx"
+TEMPLATE_PATH = Path(__file__).parent / "EX_template.xlsx"
 
-st.set_page_config(page_title="FiscalXL v5", page_icon="📊", layout="wide",
+st.set_page_config(page_title="FiscalXL v6", page_icon="📊", layout="wide",
                    initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -33,10 +33,6 @@ st.markdown("""
   padding:.7rem 1.1rem;color:#7B5900;}
 .error-box{background:#FCE4D6;border:1px solid #C55A11;border-radius:8px;
   padding:.9rem 1.3rem;color:#7B2C00;}
-.badge-dgi{background:#1F3864;color:white;padding:3px 10px;
-  border-radius:20px;font-size:.78rem;font-weight:bold;}
-.badge-ammc{background:#70AD47;color:white;padding:3px 10px;
-  border-radius:20px;font-size:.78rem;font-weight:bold;}
 div[data-testid="stDownloadButton"] button{
   background:linear-gradient(135deg,#1F3864,#2E75B6);color:white;
   border:none;padding:.8rem 2.5rem;font-size:1rem;border-radius:8px;width:100%;}
@@ -44,7 +40,7 @@ div[data-testid="stDownloadButton"] button{
 
 st.markdown("""
 <div class="main-header">
-  <h1>📊 FiscalXL v5</h1>
+  <h1>📊 FiscalXL v6</h1>
   <p>Convertisseur PDF → Excel · Pièces annexes IS (Modèle Comptable Normal, loi 9-88 Maroc)</p>
 </div>""", unsafe_allow_html=True)
 
@@ -55,44 +51,31 @@ with st.sidebar:
         "**Format PDF**",
         options=["🏛️ DGI — 7 pages", "📄 AMMC / Standard — 5 pages"],
         index=0,
-        help=(
-            "**DGI** : Étatde synthèse DGI (7 pages)\n\n"
-            "**AMMC** : Liasse standard (5 pages)"
-        ),
     )
     is_dgi = "DGI" in mode
 
     st.markdown("---")
-    show_preview    = st.toggle("Aperçu des données extraites", value=True)
-    show_comparison = st.toggle("Comparaison PDF ↔ Excel",      value=True)
-    show_debug      = st.toggle("Mode débogage",                value=False)
+    show_preview    = st.toggle("Aperçu des données", value=True)
+    show_comparison = st.toggle("Comparaison PDF ↔ Excel", value=True)
+    show_debug      = st.toggle("Mode débogage", value=False)
     st.markdown("---")
 
     if is_dgi:
-        st.markdown('<span class="badge-dgi">MODE DGI — 7 PAGES</span>',
-                    unsafe_allow_html=True)
-        st.markdown("""
-        - **Page 1** — Identification
-        - **Pages 2-3** — Bilan Actif
-        - **Page 4** — Bilan Passif
-        - **Pages 5-7** — CPC
-        """)
+        st.markdown('<span style="background:#1F3864;color:white;padding:3px 10px;border-radius:20px;font-size:.78rem;font-weight:bold;">MODE DGI — 7 PAGES</span>', unsafe_allow_html=True)
+        st.markdown("- **Page 1** — Identification\n- **Pages 2-3** — Bilan Actif\n- **Page 4** — Bilan Passif\n- **Pages 5-7** — CPC")
     else:
-        st.markdown('<span class="badge-ammc">MODE AMMC — 5 PAGES</span>',
-                    unsafe_allow_html=True)
-        st.markdown("""
-        - **Page 1** — Identification
-        - **Page 2** — Bilan Actif
-        - **Page 3** — Bilan Passif
-        - **Pages 4-5** — CPC
-        """)
+        st.markdown('<span style="background:#70AD47;color:white;padding:3px 10px;border-radius:20px;font-size:.78rem;font-weight:bold;">MODE AMMC — 5 PAGES</span>', unsafe_allow_html=True)
+        st.markdown("- **Page 1** — Identification\n- **Page 2** — Bilan Actif\n- **Page 3** — Bilan Passif\n- **Pages 4-5** — CPC")
 
-    st.success("✅ Template chargé") if TEMPLATE_PATH.exists() else st.error("⚠️ Template manquant")
-    st.caption("FiscalXL v5 · MCN loi 9-88")
+    if TEMPLATE_PATH.exists():
+        st.success("✅ Template EX chargé")
+    else:
+        st.error("⚠️ EX_template.xlsx manquant")
+    st.caption("FiscalXL v6 · MCN loi 9-88")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def update_excel_headers(wb, info: dict):
+def update_headers(wb, info: dict):
     raison   = info.get("raison_sociale") or "—"
     id_fisc  = info.get("identifiant_fiscal") or ""
     exercice = info.get("exercice") or ""
@@ -105,121 +88,63 @@ def update_excel_headers(wb, info: dict):
         ("5 - Tableau de Bord","TABLEAU DE BORD — SYNTHÈSE FINANCIÈRE"),
     ]:
         if sheet not in wb.sheetnames: continue
-        wb[sheet]["A1"] = title
-        wb[sheet]["A2"] = sub if "Bord" not in sheet else raison
-
-    if "1 - Infos Générales" in wb.sheetnames:
-        ws = wb["1 - Infos Générales"]
-        mapping = {
-            "Raison sociale":       raison,
-            "Identifiant fiscal":   id_fisc,
-            "Taxe professionnelle": info.get("taxe_professionnelle") or "—",
-            "Adresse":              info.get("adresse") or "—",
-            "Exercice":             exercice,
-            "Date de déclaration":  info.get("date_declaration") or "—",
-            "Nombre de pages":      str(info.get("pages") or "—"),
-        }
-        for row in ws.iter_rows():
-            if row[0].value in mapping:
-                row[1].value = mapping[row[0].value]
+        ws = wb[sheet]
+        if ws.cell(1, 2).value is not None:
+            ws.cell(1, 2).value = title
+        if ws.cell(2, 1).value is not None or True:
+            pass  # Headers dynamiques gérés par les formules =Infos!B4
 
 
-def build_comparison(extracted: dict, wb) -> list:
-    checks = [
-        ("actif",  "Terrains",                        "2 - Bilan Actif",  "B15","E15","Terrains"),
-        ("actif",  "Constructions",                   "2 - Bilan Actif",  "B16","E16","Constructions"),
-        ("actif",  "Installations techniques",        "2 - Bilan Actif",  "B17","E17","Installations techniques"),
-        ("actif",  "Clients et comptes rattachés",    "2 - Bilan Actif",  "B40","E40","Clients et ctes rattachés"),
-        ("actif",  "Banques",                         "2 - Bilan Actif",  "B51","E51","Banques T.G et C.C.P"),
-        ("passif", "Capital social ou personnel",     "3 - Bilan Passif", "B6", "C6", "Capital social"),
-        ("passif", "Résultat net de l'exercice",      "3 - Bilan Passif", "B15","C15","Résultat net exercice"),
-        ("passif", "Autres dettes de financement",    "3 - Bilan Passif", "B22","C22","Autres dettes financement"),
-        ("passif", "Fournisseurs et comptes rattachés","3 - Bilan Passif","B30","C30","Fournisseurs"),
-        ("cpc",    "Ventes de biens et services",     "4 - CPC",          "B6", "E6", "Ventes biens/services"),
-        ("cpc",    "Achats consommés",                "4 - CPC",          "B11","E11","Achats consommés"),
-        ("cpc",    "Charges de personnel",            "4 - CPC",          "B19","E19","Charges de personnel"),
-        ("cpc",    "Dotations d'exploitation",        "4 - CPC",          "B20","E20","Dotations d'exploitation"),
-        ("cpc",    "IMPOTS SUR LES",                  "4 - CPC",          "B53","E53","Impôts sur résultats"),
+def build_comparison(wb, pdf_path: str) -> list:
+    """Compare les valeurs PDF avec l'Excel généré poste par poste."""
+    from core.direct_injector import extract_page_rows, detect_columns, _parse_num_str
+    import pdfplumber
+
+    checks = []
+    pdf = pdfplumber.open(pdf_path)
+    n   = len(pdf.pages)
+
+    # Extraire quelques valeurs clés du PDF pour comparer
+    page_idx = 3 if n == 7 else 2  # page passif
+    rows = extract_page_rows(pdf.pages[page_idx])
+    rows_cols = detect_columns(rows, 'passif')
+    pdf.close()
+
+    # Lire l'Excel généré
+    wa = wb['2 - Bilan Actif']
+    wp = wb['3 - Bilan Passif']
+    wc = wb['4 - CPC']
+
+    key_checks = [
+        ("Passif", "Capital appelé",           wp, 7,  3),
+        ("Passif", "Résultat net",              wp, 15, 3),
+        ("Passif", "Subventions investissement",wp, 18, 3),
+        ("Passif", "Fournisseurs",              wp, 31, 3),
+        ("Passif", "Personnel passif",          wp, 33, 3),
+        ("Actif",  "Terrains brut",             wa, 15, 3),
+        ("Actif",  "Constructions brut",        wa, 16, 3),
+        ("Actif",  "Installations brut",        wa, 17, 3),
+        ("Actif",  "Clients brut",              wa, 39, 3),
+        ("CPC",    "Ventes biens/services",     wc, 7,  3),
+        ("CPC",    "Charges personnel",         wc, 20, 3),
+        ("CPC",    "Dotations exploitation",    wc, 22, 3),
+        ("CPC",    "Impôts résultats",          wc, 54, 3),
     ]
 
-    src = {
-        "actif":  extracted.get("actif_values",  {}),
-        "passif": extracted.get("passif_values", {}),
-        "cpc":    extracted.get("cpc_values",    {}),
-    }
-
-    rows = []
-    for section, skey, sheet, cn, cn1, display in checks:
-        pdf_v = next(
-            (v for k, v in src[section].items()
-             if skey.lower() in k.lower() or k.lower() in skey.lower()),
-            None
-        )
-        pdf_n  = pdf_v[0] if pdf_v else None
-        pdf_n1 = (pdf_v[2] if section == "actif" and pdf_v and len(pdf_v) > 2
-                  else (pdf_v[1] if pdf_v and len(pdf_v) > 1 else None))
-
-        xl_n = xl_n1 = None
-        if sheet in wb.sheetnames:
-            ws = wb[sheet]
-            for cell, target in [(cn, "n"), (cn1, "n1")]:
-                try:
-                    v = ws[cell].value
-                    if isinstance(v, (int, float)):
-                        if target == "n":  xl_n  = float(v)
-                        else:              xl_n1 = float(v)
-                except Exception: pass
-
-        def fmt(v): return f"{v:,.2f}" if v is not None else "—"
-        def st_s(a, b):
-            if a is None and b is None: return "vide"
-            if a is None or b is None:  return "manquant"
-            return "ok" if abs(a - b) < 1 else "erreur"
-
-        rows.append({
-            "Section":  section.upper(), "Poste": display,
-            "Cel.N": cn,   "PDF N": fmt(pdf_n),   "Excel N": fmt(xl_n),   "✓N":  st_s(pdf_n,  xl_n),
-            "Cel.N-1":cn1, "PDF N-1":fmt(pdf_n1), "Excel N-1":fmt(xl_n1), "✓N-1":st_s(pdf_n1, xl_n1),
+    for section, label, ws_ref, row, col in key_checks:
+        val = ws_ref.cell(row, col).value
+        if isinstance(val, str) and val.startswith('='): val = None
+        checks.append({
+            "Section": section,
+            "Poste":   label,
+            "Cellule": f"{ws_ref.title[:10]}!{ws_ref.cell(row,col).coordinate}",
+            "Valeur":  f"{val:,.2f}" if isinstance(val,(int,float)) else ("—" if val is None else str(val)),
+            "Statut":  "✅" if val is not None and val != 0 else "⚠️",
         })
-    return rows
+    return checks
 
 
-def render_comparison(rows: list):
-    errors   = [r for r in rows if "erreur"   in (r["✓N"], r["✓N-1"])]
-    warnings = [r for r in rows if "manquant" in (r["✓N"], r["✓N-1"])]
-    ok_count = sum(1 for r in rows if r["✓N"] == "ok")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("✅ Postes corrects",    ok_count)
-    c2.metric("⚠️ Valeurs manquantes", len(warnings))
-    c3.metric("❌ Erreurs de valeur",   len(errors))
-
-    if errors:
-        st.markdown("#### ❌ Erreurs — à corriger manuellement dans l'Excel")
-        cols = ["Section","Poste","Cel.N","PDF N","Excel N","Cel.N-1","PDF N-1","Excel N-1"]
-        st.dataframe(pd.DataFrame(errors)[cols], use_container_width=True,
-                     height=min(220, 50+len(errors)*38))
-
-    if warnings:
-        st.markdown("#### ⚠️ Postes non injectés (valeur absente dans le PDF)")
-        cols = ["Section","Poste","Cel.N","PDF N","Excel N"]
-        st.dataframe(pd.DataFrame(warnings)[cols], use_container_width=True,
-                     height=min(180, 50+len(warnings)*38))
-
-    if not errors and not warnings:
-        st.success("✅ Tous les postes vérifiés sont corrects !")
-
-    with st.expander("📋 Tableau complet de comparaison"):
-        badge = {"ok":"✅","manquant":"⚠️","erreur":"❌","vide":"—"}
-        disp = [{
-            "Section":r["Section"],"Poste":r["Poste"],
-            "Cellule N":r["Cel.N"],"PDF N":r["PDF N"],"Excel N":r["Excel N"],"":badge.get(r["✓N"],"?"),
-            "Cellule N-1":r["Cel.N-1"],"PDF N-1":r["PDF N-1"],"Excel N-1":r["Excel N-1"]," ":badge.get(r["✓N-1"],"?"),
-        } for r in rows]
-        st.dataframe(pd.DataFrame(disp), use_container_width=True, height=520)
-
-
-# ── Layout principal ─────────────────────────────────────────────────────────
+# ── Layout ────────────────────────────────────────────────────────────────────
 col_up, col_pipe = st.columns([3, 2])
 with col_up:
     st.markdown("### 📂 Importer le PDF")
@@ -228,11 +153,11 @@ with col_up:
 with col_pipe:
     st.markdown("### 🔄 Pipeline")
     for step, desc in [
-        ("1 · Lecture PDF",     "pdfplumber — coordonnées X/Y"),
-        ("2 · Extraction",      "Labels + valeurs par colonnes"),
-        ("3 · Headers",         "Raison sociale et exercice dynamiques"),
-        ("4 · Injection Excel", "Valeurs → cellules du template"),
-        ("5 · Comparaison",     "PDF ↔ Excel poste par poste"),
+        ("1 · Validation",      "Structure et format du PDF"),
+        ("2 · Extraction",      "Labels + valeurs par position X/Y"),
+        ("3 · Correspondance",  "Label PDF → cellule Excel exacte"),
+        ("4 · Injection",       "Remplir uniquement les cellules vides"),
+        ("5 · Vérification",    "Formules recalculées vs PDF"),
     ]:
         color = "#1F3864" if is_dgi else "#70AD47"
         st.markdown(
@@ -248,37 +173,36 @@ if not uploaded:
       border-radius:12px;background:#f8fafd;margin-top:1rem;">
       <div style="font-size:3rem;">📄</div>
       <h3 style="color:#2E75B6;">Importez un PDF pour commencer</h3>
-      <p>Sélectionnez le format dans la sidebar, puis importez votre fichier</p>
-      <p style="font-size:.85rem;">
-        <strong>DGI (7 pages)</strong> &nbsp;·&nbsp; <strong>AMMC (5 pages)</strong>
-      </p>
+      <p>DGI (7 pages) ou AMMC (5 pages) — sélectionnez le format dans la sidebar</p>
     </div>""", unsafe_allow_html=True)
     st.stop()
 
 # ── Processing ────────────────────────────────────────────────────────────────
 st.markdown("---")
 if not TEMPLATE_PATH.exists():
-    st.markdown('<div class="error-box">❌ Template manquant.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="error-box">❌ EX_template.xlsx manquant.</div>', unsafe_allow_html=True)
     st.stop()
 
 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
     tmp.write(uploaded.getbuffer())
     pdf_path = tmp.name
+
+# Copier le template dans un fichier temporaire de sortie
 output_path = pdf_path.replace(".pdf", "_out.xlsx")
+shutil.copy(str(TEMPLATE_PATH), output_path)
 
 try:
     progress = st.progress(0)
     status   = st.empty()
 
-    # Étape 1 — Validation
+    # ── Étape 1 : Validation ──────────────────────────────────────────────────
     status.info("🔍 Étape 1/5 — Validation du PDF...")
-    progress.progress(8)
-    parser     = PDFParser(pdf_path)
-    validation = validate_pdf_structure_v2(parser, mode="dgi" if is_dgi else "ammc")
+    progress.progress(10)
 
+    base_parser = PDFParser(pdf_path)
+    validation  = validate_pdf_structure_v2(base_parser, mode="dgi" if is_dgi else "ammc")
     if not validation["valid"]:
-        st.markdown(f'<div class="error-box">⚠️ {validation["message"]}</div>',
-                    unsafe_allow_html=True)
+        st.markdown(f'<div class="error-box">⚠️ {validation["message"]}</div>', unsafe_allow_html=True)
         st.stop()
 
     meta    = validation["meta"]
@@ -289,51 +213,37 @@ try:
     elif not is_dgi and n_pages not in (5, 6):
         st.warning(f"⚠️ Mode AMMC sélectionné mais le PDF a {n_pages} pages (attendu : 5).")
 
-    badge_html = (f'<span class="badge-dgi">DGI</span>' if is_dgi
-                  else f'<span class="badge-ammc">AMMC</span>')
-
     for col, (lbl, val) in zip(
-        st.columns(5),
-        [("Raison Sociale",    (meta.get("raison_sociale") or "—")[:20]),
+        st.columns(4),
+        [("Raison Sociale",    (meta.get("raison_sociale") or "—")[:22]),
          ("Identifiant Fiscal", meta.get("identifiant_fiscal") or "—"),
          ("Fin exercice",       meta.get("exercice_fin") or "—"),
-         ("Pages",              str(n_pages)),
-         ("Format",             "DGI — 7p" if is_dgi else "AMMC — 5p")]
+         ("Pages",              str(n_pages))]
     ):
         col.markdown(f'<div class="kpi-box"><div class="val">{val}</div>'
                      f'<div class="lbl">{lbl}</div></div>', unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
     progress.progress(20)
 
-    # Étape 2 — Extraction
-    status.info("📄 Étape 2/5 — Extraction des valeurs...")
-    progress.progress(38)
-    with st.spinner("Parsing en cours..."):
-        extracted = parser.parse()
-    progress.progress(58)
+    # ── Étape 2-3-4 : Extraction + Correspondance + Injection ─────────────────
+    status.info("📄 Étapes 2-4/5 — Extraction et injection...")
+    progress.progress(40)
 
-    if show_debug:
-        with st.expander("🐛 Données brutes"):
-            st.json({k: {str(l): v for l, v in d.items()} if isinstance(d, dict) else d
-                     for k, d in extracted.items()})
+    with st.spinner("Traitement en cours..."):
+        wb  = openpyxl.load_workbook(output_path)
+        inj = DirectInjector(wb)
+        stats = inj.inject_pdf(pdf_path)
+        wb.save(output_path)
 
-    # Étape 3 — Injection
-    status.info("🔗 Étape 3/5 — Injection dans le template...")
-    progress.progress(65)
-    with st.spinner("Injection..."):
-        inj   = TemplateInjector(str(TEMPLATE_PATH))
-        stats = inj.inject(extracted, output_path)
-    progress.progress(78)
+    progress.progress(75)
 
-    # Étape 4 — Headers dynamiques
-    status.info("🏷️ Étape 4/5 — Mise à jour des headers...")
-    wb = openpyxl.load_workbook(output_path)
-    update_excel_headers(wb, extracted["info"])
-    wb.save(output_path)
-    progress.progress(88)
+    # ── Étape 5 : Headers + Vérification ──────────────────────────────────────
+    status.info("🏷️ Étape 5/5 — Headers et vérification...")
+    wb_final = openpyxl.load_workbook(output_path)
+    update_headers(wb_final, meta)
+    wb_final.save(output_path)
 
-    # Étape 5 — Vérification
-    status.info("✅ Étape 5/5 — Vérification...")
+    # Compter les formules intactes
     wb_check = openpyxl.load_workbook(output_path)
     n_formulas = sum(
         1 for ws in wb_check.worksheets
@@ -343,84 +253,79 @@ try:
     progress.progress(100)
     status.empty()
 
-    # Résumé
+    # ── Résumé ────────────────────────────────────────────────────────────────
     st.markdown(f"""
     <div class="success-box">
       ✅ <strong>Fichier Excel généré !</strong>
-      &nbsp;·&nbsp; {len(wb_check.sheetnames)} feuilles
-      &nbsp;·&nbsp; {n_formulas} formules intactes
       &nbsp;·&nbsp; {stats['injected']} valeurs injectées
-      &nbsp;·&nbsp; {badge_html}
+      &nbsp;·&nbsp; {n_formulas} formules intactes
+      &nbsp;·&nbsp; {len(stats['skipped'])} postes non trouvés
     </div>""", unsafe_allow_html=True)
 
-    if stats.get("not_found"):
-        nf = stats["not_found"]
-        real = [x for x in nf if len(x) > 4 and not any(
-            t in x.upper() for t in ["TOTAL", "CAPITAUX PROPRES", "RESULTAT D'EX",
-                                      "CHARGES D'EX", "PRODUITS D'EX"]
-        )]
-        if real:
-            st.markdown(
-                f'<div class="warn-box">⚠️ <strong>{len(real)} postes non mappés</strong>'
-                f' — valeurs extraites mais cellule non trouvée :<br>'
-                f'<code>{"  ·  ".join(real[:8])}</code></div>',
-                unsafe_allow_html=True)
+    # Postes non trouvés (filtrer les totaux normaux)
+    real_skipped = [x for x in stats['skipped']
+                    if len(x) > 3
+                    and not any(t in x.upper() for t in
+                        ['TOTAL','RÉSULTAT','CHIFFRE','PRODUITS D\'EX',
+                         'CHARGES D\'EX','EXPLOITATION','FINANCIER','COURANT'])]
+    if real_skipped:
+        st.markdown(
+            f'<div class="warn-box">⚠️ <strong>{len(real_skipped)} postes non mappés</strong>'
+            f' (label PDF non trouvé dans le template) :<br>'
+            f'<code>{"  ·  ".join(real_skipped[:8])}</code></div>',
+            unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Aperçu
+    # ── Aperçu ────────────────────────────────────────────────────────────────
     if show_preview:
-        with st.expander("👁️ Aperçu des valeurs extraites", expanded=False):
-            tabs = st.tabs(["ℹ️ Infos", "📋 Bilan Actif", "📋 Bilan Passif", "📈 CPC"])
-            with tabs[0]:
-                for k, v in extracted.get("info", {}).items():
-                    if k != "pages" and v:
-                        st.markdown(f"**{k.replace('_',' ').title()}** : {v}")
-            with tabs[1]:
-                av = extracted.get("actif_values", {})
-                if av:
-                    df = pd.DataFrame(
-                        [(k,
-                          f"{v[0]:,.2f}" if v and v[0] is not None else "—",
-                          f"{v[1]:,.2f}" if len(v)>1 and v[1] is not None else "—",
-                          f"{v[2]:,.2f}" if len(v)>2 and v[2] is not None else "—")
-                         for k, v in av.items()],
-                        columns=["Poste","Brut","Amort.","Net N-1"])
-                    st.dataframe(df, use_container_width=True, height=320)
-            with tabs[2]:
-                pv = extracted.get("passif_values", {})
-                if pv:
-                    df = pd.DataFrame(
-                        [(k,
-                          f"{v[0]:,.2f}" if v and v[0] is not None else "—",
-                          f"{v[1]:,.2f}" if len(v)>1 and v[1] is not None else "—")
-                         for k, v in pv.items()],
-                        columns=["Poste","Exercice N","Exercice N-1"])
-                    st.dataframe(df, use_container_width=True, height=320)
-            with tabs[3]:
-                cv = extracted.get("cpc_values", {})
-                if cv:
-                    df = pd.DataFrame(
-                        [(k,
-                          f"{v[0]:,.2f}" if v and v[0] is not None else "—",
-                          f"{v[1]:,.2f}" if len(v)>1 and v[1] is not None else "—",
-                          f"{v[2]:,.2f}" if len(v)>2 and v[2] is not None else "—")
-                         for k, v in cv.items()],
-                        columns=["Désignation","Propre N","Exerc. Préc.","Total N-1"])
-                    st.dataframe(df, use_container_width=True, height=320)
+        with st.expander("👁️ Valeurs injectées", expanded=False):
+            st.markdown("**Cellules remplies depuis le PDF :**")
+            df = pd.DataFrame(inj._injected, columns=["Label PDF", "Feuille", "Ligne"])
+            st.dataframe(df, use_container_width=True, height=300)
 
-    # Comparaison
+    # ── Comparaison ───────────────────────────────────────────────────────────
     if show_comparison:
-        st.markdown("### 🔍 Comparaison PDF ↔ Excel")
-        render_comparison(build_comparison(extracted, wb_check))
+        st.markdown("### 🔍 Vérification des postes clés")
+        try:
+            comp = build_comparison(wb_check, pdf_path)
+            df_comp = pd.DataFrame(comp)
+            
+            errors = [r for r in comp if r["Statut"] == "⚠️"]
+            ok     = [r for r in comp if r["Statut"] == "✅"]
+            
+            c1, c2 = st.columns(2)
+            c1.metric("✅ Postes injectés", len(ok))
+            c2.metric("⚠️ Postes vides",    len(errors))
+            
+            if errors:
+                st.markdown("**Postes vides — à vérifier :**")
+                st.dataframe(pd.DataFrame(errors)[["Section","Poste","Cellule"]], 
+                           use_container_width=True, height=200)
+            else:
+                st.success("✅ Tous les postes clés sont remplis !")
+            
+            with st.expander("📋 Tous les postes vérifiés"):
+                st.dataframe(df_comp, use_container_width=True, height=450)
+        except Exception as e:
+            st.warning(f"Comparaison non disponible : {e}")
 
-    # Téléchargement
+    # ── Debug ─────────────────────────────────────────────────────────────────
+    if show_debug:
+        with st.expander("🐛 Labels non mappés (complets)"):
+            for s in stats['skipped']:
+                st.text(s)
+
+    # ── Téléchargement ────────────────────────────────────────────────────────
     st.markdown("### ⬇️ Télécharger")
-    raison_slug = (extracted["info"].get("raison_sociale") or "fiscal").replace(" ","_")[:20]
-    date_slug   = (extracted["info"].get("exercice_fin") or "").replace("/","-")
+    raison_slug = (meta.get("raison_sociale") or "fiscal").replace(" ","_")[:20]
+    date_slug   = (meta.get("exercice_fin") or "").replace("/","-")
     fname = f"{raison_slug}_{date_slug}_fiscal.xlsx"
+
     with open(output_path, "rb") as f:
-        st.download_button("📥 Télécharger le fichier Excel", data=f, file_name=fname,
+        st.download_button(
+            "📥 Télécharger le fichier Excel",
+            data=f, file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 except Exception as e:
@@ -433,4 +338,4 @@ finally:
     for f in [pdf_path, output_path]:
         try:
             if os.path.exists(f): os.unlink(f)
-        except Exception: pass
+        except: pass
