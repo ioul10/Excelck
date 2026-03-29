@@ -87,10 +87,12 @@ def soft_normalize(s: str) -> str:
     Retire les suffixes [A], [B], (1), (2), etc. et préfixes romains (XII, XI...).
     """
     s = str(s).strip()
+    # Retirer préfixe astérisque "* Label" → "Label" (format BORJ/Etats)
+    s = re.sub(r'^\*\s*', '', s)
     # Retirer suffixes de section : [A], [B] en fin de chaîne
     s = re.sub(r'\s*\[\w\]\s*$', '', s)
-    # Retirer (1), (2) en milieu ou fin de chaîne (ex: "Achats consommés(2) de")
-    s = re.sub(r'\(\d+\)', '', s)
+    # Retirer ( A ), ( B ), (A), (1), (2) partout
+    s = re.sub(r'\s*\(\s*\d?\w?\s*\)\s*', ' ', s)
     # Retirer préfixes numéros romains en début : "XII IMPOTS" → "IMPOTS"
     s = re.sub(
         r'^(XVI|XV|XIV|XIII|XII|XI|X|IX|VIII|VII|VI|IV|III|II|I)\s+',
