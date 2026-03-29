@@ -21,6 +21,19 @@ logger = get_logger(__name__)
 # ── Alias PDF → label normalisé Excel ─────────────────────────────────────────
 # Quand le PDF utilise une abréviation ou variante du label Excel
 ALIASES = {
+    # CPC — labels tronqués (label sur 2 lignes dans le PDF)
+    'achats consommés de matières et':           'achats consommés de matières et fournitures',
+    'achats consommés de matières et fournitures': 'achats consommés de matières et fournitures',
+    # CPC — variantes avec (2) et accents
+    'achats consommés de matières et fournitures': 'achats consommés de matières et fournitures',
+    'achats revendus(2) de marchandises':             'achats revendus de marchandises',
+    'impots sur les benefices':                       'impôts sur les bénéfices',
+    'impots sur les résultats':                       'impôts sur les bénéfices',
+    'reprises d\'exploitation : transferts de charges': 'reprises d\'exploitation : transferts de charges',
+    'interêts et autres produits financiers':         'intérêts et autres produits financiers',
+    'reprises financières : transfert charges':       'reprises financières : transferts de charges',
+    'charges d\'interêts':                           'charges d\'intérêts',
+    'subventions d\'exploitation':                   'subventions d\'exploitation',
     # Actif
     'immobilisations en recherche et dev.':     'immobilisations en recherche et développement',
     'immobilisations en recherche et dev':      'immobilisations en recherche et développement',
@@ -71,11 +84,18 @@ SECTION_TITLES = {
 def soft_normalize(s: str) -> str:
     """
     Normalisation légère — garde les accents, uniformise espaces et tirets.
-    Retire les suffixes [A], [B], (1), (2), etc.
+    Retire les suffixes [A], [B], (1), (2), etc. et préfixes romains (XII, XI...).
     """
     s = str(s).strip()
-    # Retirer suffixes de section : [A], [B], (1)...
-    s = re.sub(r'\s*[\[\(]\w[\]\)]\s*$', '', s)
+    # Retirer suffixes de section : [A], [B] en fin de chaîne
+    s = re.sub(r'\s*\[\w\]\s*$', '', s)
+    # Retirer (1), (2) en milieu ou fin de chaîne (ex: "Achats consommés(2) de")
+    s = re.sub(r'\(\d+\)', '', s)
+    # Retirer préfixes numéros romains en début : "XII IMPOTS" → "IMPOTS"
+    s = re.sub(
+        r'^(XVI|XV|XIV|XIII|XII|XI|X|IX|VIII|VII|VI|IV|III|II|I)\s+',
+        '', s, flags=re.IGNORECASE
+    )
     # Uniformiser tirets
     s = re.sub(r'\s*[-–—]\s*', ' - ', s)
     # Espaces multiples
@@ -221,7 +241,22 @@ def extract_page_rows(page) -> list:
         if label or vals:
             result.append((label, vals))
 
-    return result
+    # Post-traitement : fusionner les lignes de nums orphelines
+    # (label sur ligne précédente, nums sur ligne suivante — cas label multi-ligne PDF)
+    merged = []
+    i = 0
+    while i < len(result):
+        label, vals = result[i]
+        # Si la prochaine ligne n'a pas de label mais a des valeurs → fusionner
+        if (not vals and label and
+                i + 1 < len(result) and
+                not result[i+1][0] and result[i+1][1]):
+            merged.append((label, result[i+1][1]))
+            i += 2
+            continue
+        merged.append((label, vals))
+        i += 1
+    return merged
 
 
 def detect_columns(page_rows: list, section: str) -> list:
@@ -272,16 +307,38 @@ def detect_columns(page_rows: list, section: str) -> list:
             net_n1 = assigned.get(n_cols - 1) if n_cols >= 3 else None
             result.append((label, [brut, amort, net_n1]))
 
-        elif section in ('passif', 'cpc'):
+        elif section == 'passif':
             # Colonnes : val_n, val_n1
             val_n  = assigned.get(0)
             val_n1 = assigned.get(n_cols - 1) if n_cols >= 2 else None
             result.append((label, [val_n, val_n1]))
 
+        elif section == 'cpc':
+            # Colonnes : propre_n(0), prec_n(1), total_n(2), total_n1(last)
+            propre_n = assigned.get(0)
+            prec_n   = assigned.get(1) if n_cols >= 2 else None
+            total_n1 = assigned.get(n_cols - 1) if n_cols >= 3 else None
+            result.append((label, [propre_n, prec_n, total_n1]))
+
         else:
             result.append((label, [v for _, v in vals]))
 
-    return result
+    # Post-traitement : fusionner les lignes de nums orphelines
+    # (label sur ligne précédente, nums sur ligne suivante — cas label multi-ligne PDF)
+    merged = []
+    i = 0
+    while i < len(result):
+        label, vals = result[i]
+        # Si la prochaine ligne n'a pas de label mais a des valeurs → fusionner
+        if (not vals and label and
+                i + 1 < len(result) and
+                not result[i+1][0] and result[i+1][1]):
+            merged.append((label, result[i+1][1]))
+            i += 2
+            continue
+        merged.append((label, vals))
+        i += 1
+    return merged
 
 
 class DirectInjector:
@@ -364,24 +421,24 @@ class DirectInjector:
                 continue
 
             if section == 'actif':
+                # C=Brut, D=Amort, F=Net N-1
                 brut, amort, net_n1 = (vals + [None, None, None])[:3]
-                if brut is not None:
-                    ws.cell(row, 3).value = brut   # col C = Brut
-                    count += 1
-                if amort is not None:
-                    ws.cell(row, 4).value = amort  # col D = Amort
-                    count += 1
-                if net_n1 is not None:
-                    ws.cell(row, 6).value = net_n1 # col F = Net N-1
-                    count += 1
-            else:  # passif ou cpc
+                if brut   is not None: ws.cell(row, 3).value = brut;   count += 1
+                if amort  is not None: ws.cell(row, 4).value = amort;  count += 1
+                if net_n1 is not None: ws.cell(row, 6).value = net_n1; count += 1
+
+            elif section == 'passif':
+                # C=Exercice N, D=Exercice N-1
                 val_n, val_n1 = (vals + [None, None])[:2]
-                if val_n is not None:
-                    ws.cell(row, 3).value = val_n   # col C = N
-                    count += 1
-                if val_n1 is not None:
-                    ws.cell(row, 4).value = val_n1  # col D = N-1
-                    count += 1
+                if val_n  is not None: ws.cell(row, 3).value = val_n;  count += 1
+                if val_n1 is not None: ws.cell(row, 4).value = val_n1; count += 1
+
+            elif section == 'cpc':
+                # C=Propres exercice, D=Exercices précédents, F=Total N-1
+                propre_n, prec_n, total_n1 = (vals + [None, None, None])[:3]
+                if propre_n  is not None: ws.cell(row, 3).value = propre_n;  count += 1
+                if prec_n    is not None: ws.cell(row, 4).value = prec_n;    count += 1
+                if total_n1  is not None: ws.cell(row, 6).value = total_n1;  count += 1
 
             self._injected.append((label, sheet_name, row))
 
