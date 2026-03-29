@@ -1,4 +1,4 @@
-"""FiscalXL v5 — Mode DGI (Camelot) + AMMC (X/Y) + Headers dynamiques + Comparaison"""
+"""FiscalXL v5 — Un seul parseur X/Y (pdfplumber) pour DGI et AMMC"""
 
 import streamlit as st
 import tempfile, os
@@ -7,15 +7,9 @@ import pandas as pd
 import openpyxl
 
 from core.pdf_parser import PDFParser
-try:
-    from core.dgi_parser import DGIParser
-    CAMELOT_OK = True
-except ImportError:
-    CAMELOT_OK = False
-    DGIParser  = None
-from core.injector    import TemplateInjector
-from utils.validator  import validate_pdf_structure_v2
-from utils.logger     import get_logger
+from core.injector   import TemplateInjector
+from utils.validator import validate_pdf_structure_v2
+from utils.logger    import get_logger
 
 logger = get_logger(__name__)
 TEMPLATE_PATH = Path(__file__).parent / "template_fiscal.xlsx"
@@ -29,17 +23,23 @@ st.markdown("""
   border-radius:12px;margin-bottom:1.2rem;}
 .main-header h1{color:white;margin:0;font-size:1.8rem;}
 .main-header p{color:#BDD7EE;margin:.3rem 0 0;font-size:.88rem;}
-.kpi-box{background:white;border:1px solid #BDD7EE;border-radius:8px;padding:.7rem;text-align:center;}
-.kpi-box .val{font-size:1.2rem;font-weight:bold;color:#1F3864;}
+.kpi-box{background:white;border:1px solid #BDD7EE;border-radius:8px;
+  padding:.7rem;text-align:center;}
+.kpi-box .val{font-size:1.15rem;font-weight:bold;color:#1F3864;}
 .kpi-box .lbl{font-size:.72rem;color:#888;margin-top:.2rem;}
-.success-box{background:#E2EFDA;border:1px solid #70AD47;border-radius:8px;padding:.9rem 1.3rem;color:#375623;}
-.warn-box{background:#FFF2CC;border:1px solid #FFD700;border-radius:8px;padding:.7rem 1.1rem;color:#7B5900;}
-.error-box{background:#FCE4D6;border:1px solid #C55A11;border-radius:8px;padding:.9rem 1.3rem;color:#7B2C00;}
-.badge-dgi{background:#1F3864;color:white;padding:3px 10px;border-radius:20px;font-size:.78rem;font-weight:bold;}
-.badge-ammc{background:#70AD47;color:white;padding:3px 10px;border-radius:20px;font-size:.78rem;font-weight:bold;}
+.success-box{background:#E2EFDA;border:1px solid #70AD47;border-radius:8px;
+  padding:.9rem 1.3rem;color:#375623;}
+.warn-box{background:#FFF2CC;border:1px solid #FFD700;border-radius:8px;
+  padding:.7rem 1.1rem;color:#7B5900;}
+.error-box{background:#FCE4D6;border:1px solid #C55A11;border-radius:8px;
+  padding:.9rem 1.3rem;color:#7B2C00;}
+.badge-dgi{background:#1F3864;color:white;padding:3px 10px;
+  border-radius:20px;font-size:.78rem;font-weight:bold;}
+.badge-ammc{background:#70AD47;color:white;padding:3px 10px;
+  border-radius:20px;font-size:.78rem;font-weight:bold;}
 div[data-testid="stDownloadButton"] button{
-  background:linear-gradient(135deg,#1F3864,#2E75B6);color:white;border:none;
-  padding:.8rem 2.5rem;font-size:1rem;border-radius:8px;width:100%;}
+  background:linear-gradient(135deg,#1F3864,#2E75B6);color:white;
+  border:none;padding:.8rem 2.5rem;font-size:1rem;border-radius:8px;width:100%;}
 </style>""", unsafe_allow_html=True)
 
 st.markdown("""
@@ -56,10 +56,8 @@ with st.sidebar:
         options=["🏛️ DGI — 7 pages", "📄 AMMC / Standard — 5 pages"],
         index=0,
         help=(
-            "**DGI** : Étatde synthèse DGI (7 pages)\n"
-            "Utilise Camelot Lattice — détection par bordures\n\n"
-            "**AMMC** : Liasse standard (5 pages)\n"
-            "Utilise l'algorithme X/Y pdfplumber"
+            "**DGI** : Étatde synthèse DGI (7 pages)\n\n"
+            "**AMMC** : Liasse standard (5 pages)"
         ),
     )
     is_dgi = "DGI" in mode
@@ -71,12 +69,8 @@ with st.sidebar:
     st.markdown("---")
 
     if is_dgi:
-        st.markdown('<span class="badge-dgi">MODE DGI — Camelot Lattice</span>',
+        st.markdown('<span class="badge-dgi">MODE DGI — 7 PAGES</span>',
                     unsafe_allow_html=True)
-        if not CAMELOT_OK:
-            st.error("⚠️ camelot-py non installé.\n\n"
-                     "Installez-le :\n`pip install camelot-py[cv]`\n"
-                     "et `ghostscript` (système)")
         st.markdown("""
         - **Page 1** — Identification
         - **Pages 2-3** — Bilan Actif
@@ -84,7 +78,7 @@ with st.sidebar:
         - **Pages 5-7** — CPC
         """)
     else:
-        st.markdown('<span class="badge-ammc">MODE AMMC — Algorithme X/Y</span>',
+        st.markdown('<span class="badge-ammc">MODE AMMC — 5 PAGES</span>',
                     unsafe_allow_html=True)
         st.markdown("""
         - **Page 1** — Identification
@@ -93,17 +87,14 @@ with st.sidebar:
         - **Pages 4-5** — CPC
         """)
 
-    if not TEMPLATE_PATH.exists():
-        st.error("⚠️ Template introuvable")
-    else:
-        st.success("✅ Template chargé")
+    st.success("✅ Template chargé") if TEMPLATE_PATH.exists() else st.error("⚠️ Template manquant")
     st.caption("FiscalXL v5 · MCN loi 9-88")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def update_excel_headers(wb, info: dict):
-    raison  = info.get("raison_sociale") or "—"
-    id_fisc = info.get("identifiant_fiscal") or ""
+    raison   = info.get("raison_sociale") or "—"
+    id_fisc  = info.get("identifiant_fiscal") or ""
     exercice = info.get("exercice") or ""
     sub = f"{raison}  —  IF: {id_fisc}" if id_fisc else raison
 
@@ -115,7 +106,7 @@ def update_excel_headers(wb, info: dict):
     ]:
         if sheet not in wb.sheetnames: continue
         wb[sheet]["A1"] = title
-        wb[sheet]["A2"] = sub if "Tableau" not in sheet else raison
+        wb[sheet]["A2"] = sub if "Bord" not in sheet else raison
 
     if "1 - Infos Générales" in wb.sheetnames:
         ws = wb["1 - Infos Générales"]
@@ -135,22 +126,20 @@ def update_excel_headers(wb, info: dict):
 
 def build_comparison(extracted: dict, wb) -> list:
     checks = [
-        # (section, search_key, sheet, cell_n, cell_n1, display)
         ("actif",  "Terrains",                        "2 - Bilan Actif",  "B15","E15","Terrains"),
         ("actif",  "Constructions",                   "2 - Bilan Actif",  "B16","E16","Constructions"),
-        ("actif",  "Installations techniques",         "2 - Bilan Actif",  "B17","E17","Installations techniques"),
-        ("actif",  "Matériel de transport",            "2 - Bilan Actif",  "B18","E18","Matériel de transport"),
-        ("actif",  "Clients et comptes rattachés",     "2 - Bilan Actif",  "B40","E40","Clients et ctes rattachés"),
-        ("actif",  "Banques",                          "2 - Bilan Actif",  "B51","E51","Banques T.G et C.C.P"),
-        ("passif", "Capital social ou personnel",      "3 - Bilan Passif", "B6", "C6", "Capital social"),
-        ("passif", "Résultat net de l'exercice",       "3 - Bilan Passif", "B15","C15","Résultat net exercice"),
-        ("passif", "Autres dettes de financement",     "3 - Bilan Passif", "B22","C22","Autres dettes financement"),
-        ("passif", "Fournisseurs et comptes rattachés","3 - Bilan Passif", "B30","C30","Fournisseurs"),
-        ("cpc",    "Ventes de biens et services",      "4 - CPC",          "B6", "E6", "Ventes biens/services"),
-        ("cpc",    "Achats consommés",                 "4 - CPC",          "B11","E11","Achats consommés"),
-        ("cpc",    "Charges de personnel",             "4 - CPC",          "B19","E19","Charges de personnel"),
-        ("cpc",    "Dotations d'exploitation",         "4 - CPC",          "B20","E20","Dotations d'exploitation"),
-        ("cpc",    "IMPOTS SUR LES",                   "4 - CPC",          "B53","E53","Impôts sur résultats"),
+        ("actif",  "Installations techniques",        "2 - Bilan Actif",  "B17","E17","Installations techniques"),
+        ("actif",  "Clients et comptes rattachés",    "2 - Bilan Actif",  "B40","E40","Clients et ctes rattachés"),
+        ("actif",  "Banques",                         "2 - Bilan Actif",  "B51","E51","Banques T.G et C.C.P"),
+        ("passif", "Capital social ou personnel",     "3 - Bilan Passif", "B6", "C6", "Capital social"),
+        ("passif", "Résultat net de l'exercice",      "3 - Bilan Passif", "B15","C15","Résultat net exercice"),
+        ("passif", "Autres dettes de financement",    "3 - Bilan Passif", "B22","C22","Autres dettes financement"),
+        ("passif", "Fournisseurs et comptes rattachés","3 - Bilan Passif","B30","C30","Fournisseurs"),
+        ("cpc",    "Ventes de biens et services",     "4 - CPC",          "B6", "E6", "Ventes biens/services"),
+        ("cpc",    "Achats consommés",                "4 - CPC",          "B11","E11","Achats consommés"),
+        ("cpc",    "Charges de personnel",            "4 - CPC",          "B19","E19","Charges de personnel"),
+        ("cpc",    "Dotations d'exploitation",        "4 - CPC",          "B20","E20","Dotations d'exploitation"),
+        ("cpc",    "IMPOTS SUR LES",                  "4 - CPC",          "B53","E53","Impôts sur résultats"),
     ]
 
     src = {
@@ -161,46 +150,44 @@ def build_comparison(extracted: dict, wb) -> list:
 
     rows = []
     for section, skey, sheet, cn, cn1, display in checks:
-        # Valeur PDF
-        pdf_v = None
-        for k, v in src[section].items():
-            if skey.lower() in k.lower() or k.lower() in skey.lower():
-                pdf_v = v; break
-
+        pdf_v = next(
+            (v for k, v in src[section].items()
+             if skey.lower() in k.lower() or k.lower() in skey.lower()),
+            None
+        )
         pdf_n  = pdf_v[0] if pdf_v else None
-        pdf_n1 = (pdf_v[2] if section == "actif" and len(pdf_v) > 2
+        pdf_n1 = (pdf_v[2] if section == "actif" and pdf_v and len(pdf_v) > 2
                   else (pdf_v[1] if pdf_v and len(pdf_v) > 1 else None))
 
-        # Valeur Excel
         xl_n = xl_n1 = None
         if sheet in wb.sheetnames:
             ws = wb[sheet]
-            for cell, attr in [(cn, 'xl_n'), (cn1, 'xl_n1')]:
+            for cell, target in [(cn, "n"), (cn1, "n1")]:
                 try:
                     v = ws[cell].value
                     if isinstance(v, (int, float)):
-                        if attr == 'xl_n':  xl_n  = float(v)
-                        else:               xl_n1 = float(v)
+                        if target == "n":  xl_n  = float(v)
+                        else:              xl_n1 = float(v)
                 except Exception: pass
 
         def fmt(v): return f"{v:,.2f}" if v is not None else "—"
-        def st(a, b):
+        def st_s(a, b):
             if a is None and b is None: return "vide"
             if a is None or b is None:  return "manquant"
             return "ok" if abs(a - b) < 1 else "erreur"
 
         rows.append({
             "Section":  section.upper(), "Poste": display,
-            "Cel.N":    cn,   "PDF N":    fmt(pdf_n),   "Excel N":   fmt(xl_n),   "St.N":  st(pdf_n,  xl_n),
-            "Cel.N-1":  cn1,  "PDF N-1":  fmt(pdf_n1),  "Excel N-1": fmt(xl_n1),  "St.N-1":st(pdf_n1, xl_n1),
+            "Cel.N": cn,   "PDF N": fmt(pdf_n),   "Excel N": fmt(xl_n),   "✓N":  st_s(pdf_n,  xl_n),
+            "Cel.N-1":cn1, "PDF N-1":fmt(pdf_n1), "Excel N-1":fmt(xl_n1), "✓N-1":st_s(pdf_n1, xl_n1),
         })
     return rows
 
 
 def render_comparison(rows: list):
-    errors   = [r for r in rows if "erreur"   in (r["St.N"], r["St.N-1"])]
-    warnings = [r for r in rows if "manquant" in (r["St.N"], r["St.N-1"])]
-    ok_count = sum(1 for r in rows if r["St.N"] == "ok")
+    errors   = [r for r in rows if "erreur"   in (r["✓N"], r["✓N-1"])]
+    warnings = [r for r in rows if "manquant" in (r["✓N"], r["✓N-1"])]
+    ok_count = sum(1 for r in rows if r["✓N"] == "ok")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("✅ Postes corrects",    ok_count)
@@ -211,28 +198,28 @@ def render_comparison(rows: list):
         st.markdown("#### ❌ Erreurs — à corriger manuellement dans l'Excel")
         cols = ["Section","Poste","Cel.N","PDF N","Excel N","Cel.N-1","PDF N-1","Excel N-1"]
         st.dataframe(pd.DataFrame(errors)[cols], use_container_width=True,
-                     height=min(200, 50 + len(errors)*38))
+                     height=min(220, 50+len(errors)*38))
 
     if warnings:
-        st.markdown("#### ⚠️ Valeurs non injectées (postes vides dans le PDF)")
+        st.markdown("#### ⚠️ Postes non injectés (valeur absente dans le PDF)")
         cols = ["Section","Poste","Cel.N","PDF N","Excel N"]
         st.dataframe(pd.DataFrame(warnings)[cols], use_container_width=True,
-                     height=min(180, 50 + len(warnings)*38))
+                     height=min(180, 50+len(warnings)*38))
 
     if not errors and not warnings:
         st.success("✅ Tous les postes vérifiés sont corrects !")
 
-    with st.expander("📋 Tableau complet (toutes les vérifications)"):
-        def badge(s):
-            return {"ok":"✅","manquant":"⚠️","erreur":"❌","vide":"—"}.get(s,"?")
-        display = [{
-            "Section": r["Section"], "Poste": r["Poste"],
-            "Cellule N": r["Cel.N"], "PDF N": r["PDF N"], "Excel N": r["Excel N"], "": badge(r["St.N"]),
-            "Cellule N-1": r["Cel.N-1"], "PDF N-1": r["PDF N-1"], "Excel N-1": r["Excel N-1"], " ": badge(r["St.N-1"]),
+    with st.expander("📋 Tableau complet de comparaison"):
+        badge = {"ok":"✅","manquant":"⚠️","erreur":"❌","vide":"—"}
+        disp = [{
+            "Section":r["Section"],"Poste":r["Poste"],
+            "Cellule N":r["Cel.N"],"PDF N":r["PDF N"],"Excel N":r["Excel N"],"":badge.get(r["✓N"],"?"),
+            "Cellule N-1":r["Cel.N-1"],"PDF N-1":r["PDF N-1"],"Excel N-1":r["Excel N-1"]," ":badge.get(r["✓N-1"],"?"),
         } for r in rows]
-        st.dataframe(pd.DataFrame(display), use_container_width=True, height=520)
+        st.dataframe(pd.DataFrame(disp), use_container_width=True, height=520)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+
+# ── Layout principal ─────────────────────────────────────────────────────────
 col_up, col_pipe = st.columns([3, 2])
 with col_up:
     st.markdown("### 📂 Importer le PDF")
@@ -240,17 +227,16 @@ with col_up:
 
 with col_pipe:
     st.markdown("### 🔄 Pipeline")
-    method = "Camelot Lattice (bordures)" if is_dgi else "Algorithme X/Y (pdfplumber)"
     for step, desc in [
-        ("1 · Lecture PDF",     method),
-        ("2 · Extraction",      "Labels + valeurs alignés"),
-        ("3 · Headers",         "Raison sociale, exercice dynamiques"),
+        ("1 · Lecture PDF",     "pdfplumber — coordonnées X/Y"),
+        ("2 · Extraction",      "Labels + valeurs par colonnes"),
+        ("3 · Headers",         "Raison sociale et exercice dynamiques"),
         ("4 · Injection Excel", "Valeurs → cellules du template"),
         ("5 · Comparaison",     "PDF ↔ Excel poste par poste"),
     ]:
+        color = "#1F3864" if is_dgi else "#70AD47"
         st.markdown(
-            f'<div style="background:#f8f9fa;border-left:4px solid '
-            f'{"#1F3864" if is_dgi else "#70AD47"};'
+            f'<div style="background:#f8f9fa;border-left:4px solid {color};'
             f'padding:.5rem .8rem;border-radius:0 6px 6px 0;margin:.3rem 0;">'
             f'<strong style="color:#1F3864">{step}</strong><br>'
             f'<span style="color:#555;font-size:.83rem">{desc}</span></div>',
@@ -263,9 +249,8 @@ if not uploaded:
       <div style="font-size:3rem;">📄</div>
       <h3 style="color:#2E75B6;">Importez un PDF pour commencer</h3>
       <p>Sélectionnez le format dans la sidebar, puis importez votre fichier</p>
-      <p style="font-size:.85rem">
-        <strong>DGI (7 pages)</strong> → Camelot Lattice &nbsp;·&nbsp;
-        <strong>AMMC (5 pages)</strong> → Algorithme X/Y
+      <p style="font-size:.85rem;">
+        <strong>DGI (7 pages)</strong> &nbsp;·&nbsp; <strong>AMMC (5 pages)</strong>
       </p>
     </div>""", unsafe_allow_html=True)
     st.stop()
@@ -288,33 +273,32 @@ try:
     # Étape 1 — Validation
     status.info("🔍 Étape 1/5 — Validation du PDF...")
     progress.progress(8)
+    parser     = PDFParser(pdf_path)
+    validation = validate_pdf_structure_v2(parser, mode="dgi" if is_dgi else "ammc")
 
-    # Utiliser PDFParser pour la validation (info de base)
-    base_parser = PDFParser(pdf_path)
-    validation  = validate_pdf_structure_v2(base_parser, mode="dgi" if is_dgi else "ammc")
     if not validation["valid"]:
         st.markdown(f'<div class="error-box">⚠️ {validation["message"]}</div>',
                     unsafe_allow_html=True)
         st.stop()
 
-    meta   = validation["meta"]
+    meta    = validation["meta"]
     n_pages = meta.get("pages", 0)
 
-    # Avertissement pages
     if is_dgi and n_pages != 7:
-        st.warning(f"⚠️ Mode DGI sélectionné mais le PDF a {n_pages} pages (attendu: 7).")
+        st.warning(f"⚠️ Mode DGI sélectionné mais le PDF a {n_pages} pages (attendu : 7).")
     elif not is_dgi and n_pages not in (5, 6):
-        st.warning(f"⚠️ Mode AMMC sélectionné mais le PDF a {n_pages} pages (attendu: 5).")
+        st.warning(f"⚠️ Mode AMMC sélectionné mais le PDF a {n_pages} pages (attendu : 5).")
 
-    # KPIs
-    badge = '<span class="badge-dgi">DGI</span>' if is_dgi else '<span class="badge-ammc">AMMC</span>'
+    badge_html = (f'<span class="badge-dgi">DGI</span>' if is_dgi
+                  else f'<span class="badge-ammc">AMMC</span>')
+
     for col, (lbl, val) in zip(
         st.columns(5),
         [("Raison Sociale",    (meta.get("raison_sociale") or "—")[:20]),
          ("Identifiant Fiscal", meta.get("identifiant_fiscal") or "—"),
          ("Fin exercice",       meta.get("exercice_fin") or "—"),
          ("Pages",              str(n_pages)),
-         ("Mode",               "DGI — Camelot" if is_dgi else "AMMC — X/Y")]
+         ("Format",             "DGI — 7p" if is_dgi else "AMMC — 5p")]
     ):
         col.markdown(f'<div class="kpi-box"><div class="val">{val}</div>'
                      f'<div class="lbl">{lbl}</div></div>', unsafe_allow_html=True)
@@ -322,28 +306,11 @@ try:
     progress.progress(20)
 
     # Étape 2 — Extraction
-    status.info(f"📄 Étape 2/5 — Extraction ({'Camelot Lattice' if is_dgi else 'Algorithme X/Y'})...")
-    progress.progress(35)
-
-    with st.spinner("Extraction en cours..."):
-        if is_dgi:
-            if not CAMELOT_OK:
-                st.markdown(
-                    '<div class="error-box">'
-                    '❌ <strong>camelot-py non installé.</strong><br>'
-                    'Mode DGI nécessite : <code>pip install camelot-py[cv]</code> '
-                    'et <code>ghostscript</code> (apt/brew install ghostscript)<br>'
-                    'Ou utilisez le mode <strong>AMMC</strong> si votre PDF fait 5 pages.'
-                    '</div>',
-                    unsafe_allow_html=True
-                )
-                st.stop()
-            parser = DGIParser(pdf_path)
-        else:
-            parser = PDFParser(pdf_path)
+    status.info("📄 Étape 2/5 — Extraction des valeurs...")
+    progress.progress(38)
+    with st.spinner("Parsing en cours..."):
         extracted = parser.parse()
-
-    progress.progress(55)
+    progress.progress(58)
 
     if show_debug:
         with st.expander("🐛 Données brutes"):
@@ -383,14 +350,14 @@ try:
       &nbsp;·&nbsp; {len(wb_check.sheetnames)} feuilles
       &nbsp;·&nbsp; {n_formulas} formules intactes
       &nbsp;·&nbsp; {stats['injected']} valeurs injectées
-      &nbsp;·&nbsp; {badge}
+      &nbsp;·&nbsp; {badge_html}
     </div>""", unsafe_allow_html=True)
 
-    # Alertes non-mappés (filtrer les totaux normaux)
     if stats.get("not_found"):
         nf = stats["not_found"]
         real = [x for x in nf if len(x) > 4 and not any(
-            t in x.upper() for t in ["TOTAL", "CAPITAUX PROPRES", "RESULTAT D'EX", "CHARGES D'EX"]
+            t in x.upper() for t in ["TOTAL", "CAPITAUX PROPRES", "RESULTAT D'EX",
+                                      "CHARGES D'EX", "PRODUITS D'EX"]
         )]
         if real:
             st.markdown(
@@ -413,7 +380,8 @@ try:
                 av = extracted.get("actif_values", {})
                 if av:
                     df = pd.DataFrame(
-                        [(k, f"{v[0]:,.2f}" if v and v[0] is not None else "—",
+                        [(k,
+                          f"{v[0]:,.2f}" if v and v[0] is not None else "—",
                           f"{v[1]:,.2f}" if len(v)>1 and v[1] is not None else "—",
                           f"{v[2]:,.2f}" if len(v)>2 and v[2] is not None else "—")
                          for k, v in av.items()],
@@ -423,7 +391,8 @@ try:
                 pv = extracted.get("passif_values", {})
                 if pv:
                     df = pd.DataFrame(
-                        [(k, f"{v[0]:,.2f}" if v and v[0] is not None else "—",
+                        [(k,
+                          f"{v[0]:,.2f}" if v and v[0] is not None else "—",
                           f"{v[1]:,.2f}" if len(v)>1 and v[1] is not None else "—")
                          for k, v in pv.items()],
                         columns=["Poste","Exercice N","Exercice N-1"])
@@ -432,7 +401,8 @@ try:
                 cv = extracted.get("cpc_values", {})
                 if cv:
                     df = pd.DataFrame(
-                        [(k, f"{v[0]:,.2f}" if v and v[0] is not None else "—",
+                        [(k,
+                          f"{v[0]:,.2f}" if v and v[0] is not None else "—",
                           f"{v[1]:,.2f}" if len(v)>1 and v[1] is not None else "—",
                           f"{v[2]:,.2f}" if len(v)>2 and v[2] is not None else "—")
                          for k, v in cv.items()],
@@ -442,21 +412,16 @@ try:
     # Comparaison
     if show_comparison:
         st.markdown("### 🔍 Comparaison PDF ↔ Excel")
-        comp_rows = build_comparison(extracted, wb_check)
-        render_comparison(comp_rows)
+        render_comparison(build_comparison(extracted, wb_check))
 
     # Téléchargement
     st.markdown("### ⬇️ Télécharger")
-    raison_slug = (extracted["info"].get("raison_sociale") or "fiscal").replace(" ", "_")[:20]
-    date_slug   = (extracted["info"].get("exercice_fin") or "").replace("/", "-")
+    raison_slug = (extracted["info"].get("raison_sociale") or "fiscal").replace(" ","_")[:20]
+    date_slug   = (extracted["info"].get("exercice_fin") or "").replace("/","-")
     fname = f"{raison_slug}_{date_slug}_fiscal.xlsx"
-
     with open(output_path, "rb") as f:
-        st.download_button(
-            "📥 Télécharger le fichier Excel",
-            data=f, file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        st.download_button("📥 Télécharger le fichier Excel", data=f, file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 except Exception as e:
     logger.exception("Erreur pipeline")
