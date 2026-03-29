@@ -152,6 +152,7 @@ PASSIF_ONLY_MARKERS = {
     'comptes regularisation passif', 'autres provisions risques charges',
     'credits escompte', 'credits tresorerie', 'banques soldes crediteurs',
     'ecarts conversion passif e', 'ecarts conversion passif circulants',
+    'etat crediteur', 'etat - crediteur',  # passif circulant ne doit pas aller en actif
 }
 
 # ─── Labels de section/total → NE PAS injecter ───────────────────────────────
@@ -241,6 +242,13 @@ PASSIF_LABEL_MAP = {
 }
 
 CPC_LABEL_MAP = {
+    # Labels avec 'de' que le fuzzy peut rater
+    "charges de personnel":                  "charges personnel",
+    "achats consommes de matieres et fournitures": "achats consommes matieres",
+    "achats consommes de matieres":          "achats consommes matieres",
+    "charges d interets":                    "charges interets",
+    "pertes de change":                      "pertes change",
+    "gains de change":                       "gains change",
     "interets et autres produits fi":       "interets autres produits financiers",
     "interets et autres produits financiers":"interets autres produits financiers",
     "achats consommes 2 de matieres et fournitures": "achats consommes matieres",
@@ -508,4 +516,6 @@ NO_INJECT_EXACT = {
     "tresorerie actif", "dettes passif circulant",
     "total general i ii iii",
     "vii vii resultat courant reports",
+    "xvi charges",  # BORJ: XVI RESULTAT NET mal parsé → bloque contamination B19
+    "xvi",          # idem
 }
