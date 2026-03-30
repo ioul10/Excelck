@@ -1,141 +1,56 @@
 """
-core/injector.py  v3 — final
-Injection directe des valeurs PDF dans les cellules exactes du template Excel.
-Matching par clé normalisée + fuzzy mots-clés + règles contextuelles (mots entiers).
+core/pdf_parser.py  v5 — Parseur universel MCN
+Supporte tous les formats PDF rencontrés:
+  - DGI officiel (7 pages): labels fragmentés, 4 colonnes x≈190-455
+  - Etats/BORJ (5 pages): séparateur †, 3-4 colonnes
+  - SAPST Liasse (5 pages): points comme milliers, digit séparé
+  - SGTM/Bilan-2017 (5 pages): format standard espace-milliers
+
+Algorithme:
+  1. extract_words() → mots avec (x0, x1, top)
+  2. Regrouper par Y (tolérance 6pt)
+  3. Détecter seuil label/nombre + zones de colonnes
+  4. Fusionner tokens numériques adjacents (gap < 6pt)
+  5. Parser nombres (formats: espaces, points, †)
+  6. Assigner aux colonnes par ordre X
 """
 
-import re, shutil
-import openpyxl
+import re
+from collections import defaultdict, Counter
+import pdfplumber
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ─── Cartes des cellules INPUT ────────────────────────────────────────────────
-# Bilan Actif  : B=Brut, C=Amort, E=Net N-1
-# Bilan Passif : B=Exercice N, C=Exercice N-1
-# CPC          : B=Propre N, C=Exercices Précédents, E=Total N-1
+# ── Patterns de skip ──────────────────────────────────────────────────────────
+SKIP_LABELS_RE = re.compile(
+    r'^(tableau|bilan\s*\(|compte de produits|b\s+i\s+l\s+a\s+n|'
+    r'modèle|exercice du|identifiant|raison sociale|'
+    r'1\)variation|2\)achats|nb\s*:|cadre réservé|'
+    r'numéro d.enregistrement|signature|'
+    r'\(1\)capital|\(2\)bénéf|pages|'
+    r'a\.i\.|a\.c\.|f\.p\.|p\.c\.|t\.\s*:|n\.c\.\s*:|e\.\s*:|f\.\s*:|'
+    r'conforme à la déclaration|etat sous référence)', re.I
+)
 
-ACTIF_CELL_MAP = {
-    "frais preliminaires":                          {"B":"B6",  "C":"C6",  "E":"E6"},
-    "charges repartir":                             {"B":"B7",  "C":"C7",  "E":"E7"},
-    "primes remboursement":                         {"B":"B8",  "C":"C8",  "E":"E8"},
-    "recherche developpement":                      {"B":"B10", "C":"C10", "E":"E10"},
-    "brevets marques droits":                       {"B":"B11", "C":"C11", "E":"E11"},
-    "fonds commercial":                             {"B":"B12", "C":"C12", "E":"E12"},
-    "autres immobilisations incorporelles":         {"B":"B13", "C":"C13", "E":"E13"},
-    "terrains":                                     {"B":"B15", "C":"C15", "E":"E15"},
-    "constructions":                                {"B":"B16", "C":"C16", "E":"E16"},
-    "installations techniques":                     {"B":"B17", "C":"C17", "E":"E17"},
-    "installations techniques materiel":            {"B":"B17", "C":"C17", "E":"E17"},
-    "materiel transport":                           {"B":"B18", "C":"C18", "E":"E18"},
-    "materiel de transport":                        {"B":"B18", "C":"C18", "E":"E18"},
-    "mobilier mat bureau":                          {"B":"B19", "C":"C19", "E":"E19"},
-    "mobilier aménagements":                        {"B":"B19", "C":"C19", "E":"E19"},
-    "autres immobilisations corporelles":           {"B":"B20", "C":"C20", "E":"E20"},
-    "immobilisations corporelles cours":            {"B":"B21", "C":"C21", "E":"E21"},
-    "prets immobilises":                            {"B":"B23", "C":"C23", "E":"E23"},
-    "autres creances financieres":                  {"B":"B24", "C":"C24", "E":"E24"},
-    "titres participation":                         {"B":"B25", "C":"C25", "E":"E25"},
-    "autres titres immobilises":                    {"B":"B26", "C":"C26", "E":"E26"},
-    "ecarts conversion actif e":                    {"B":"B27", "C":"C27", "E":"E27"},
-    "diminution creances immobilisees":             {"B":"B28", "C":"C28", "E":"E28"},
-    "augmentation dettes financieres":              {"B":"B29", "C":"C29", "E":"E29"},
-    "marchandises":                                 {"B":"B33", "C":"C33", "E":"E33"},
-    "matieres fournitures consommables":            {"B":"B34", "C":"C34", "E":"E34"},
-    "produits cours":                               {"B":"B35", "C":"C35", "E":"E35"},
-    "produits intermediaires residuels":            {"B":"B36", "C":"C36", "E":"E36"},
-    "produits finis":                               {"B":"B37", "C":"C37", "E":"E37"},
-    "fournisseurs debiteurs avances":               {"B":"B39", "C":"C39", "E":"E39"},
-    "clients comptes rattaches":                    {"B":"B40", "C":"C40", "E":"E40"},
-    "personnel actif circulant":                    {"B":"B41", "C":"C41", "E":"E41"},
-    "etat actif circulant":                         {"B":"B42", "C":"C42", "E":"E42"},
-    "comptes associes actif":                       {"B":"B43", "C":"C43", "E":"E43"},
-    "autres debiteurs":                             {"B":"B44", "C":"C44", "E":"E44"},
-    "comptes regularisation actif":                 {"B":"B45", "C":"C45", "E":"E45"},
-    "titres valeurs placement":                     {"B":"B46", "C":"C46", "E":"E46"},
-    "ecarts conversion circulants":                 {"B":"B47", "C":"C47", "E":"E47"},
-    "cheques valeurs encaisser":                    {"B":"B50", "C":"C50", "E":"E50"},
-    "banques tg ccp":                               {"B":"B51", "C":"C51", "E":"E51"},
-    "caisse regie avances":                         {"B":"B52", "C":"C52", "E":"E52"},
+SKIP_SINGLE = {
+    'brut', 'net', 'amortissements', 'provisions', 'exercice',
+    'precedent', 'précédent', 'designation', 'désignation',
+    'operations', 'opérations', 'propres', 'concernant',
+    'totaux', 'de', 'du', 'et', 'en', 'la', 'le', 'les',
+    'nature', 'exploitation', 'financier', 'courant',
 }
 
-PASSIF_CELL_MAP = {
-    "capital social":                               {"B":"B6",  "C":"C6"},
-    "moins actionnaires":                           {"B":"B7",  "C":"C7"},
-    "capital appele":                               {"B":"B8",  "C":"C8"},
-    "prime emission fusion":                        {"B":"B9",  "C":"C9"},
-    "ecarts reevaluation":                          {"B":"B10", "C":"C10"},
-    "reserve legale":                               {"B":"B11", "C":"C11"},
-    "autres reserves":                              {"B":"B12", "C":"C12"},
-    "report nouveau":                               {"B":"B13", "C":"C13"},
-    "resultat instance affectation":                {"B":"B14", "C":"C14"},
-    "resultat net exercice passif":                 {"B":"B15", "C":"C15"},
-    "subventions investissement passif":            {"B":"B18", "C":"C18"},
-    "provisions reglementees":                      {"B":"B19", "C":"C19"},
-    "dettes financement":                           {"B":"B20", "C":"C20"},
-    "emprunts obligataires":                        {"B":"B21", "C":"C21"},
-    "autres dettes financement":                    {"B":"B22", "C":"C22"},
-    "provisions durables risques":                  {"B":"B23", "C":"C23"},
-    "provisions risques":                           {"B":"B24", "C":"C24"},
-    "provisions charges":                           {"B":"B25", "C":"C25"},
-    "ecarts conversion passif e":                   {"B":"B26", "C":"C26"},
-    "augmentation creances immobilisees":           {"B":"B27", "C":"C27"},
-    "diminution dettes financement":                {"B":"B28", "C":"C28"},
-    "fournisseurs comptes rattaches passif":        {"B":"B32", "C":"C32"},
-    "clients crediteurs avances passif":            {"B":"B33", "C":"C33"},
-    "personnel passif":                             {"B":"B34", "C":"C34"},
-    "organismes sociaux":                           {"B":"B35", "C":"C35"},
-    "etat passif":                                  {"B":"B36", "C":"C36"},
-    "comptes associes passif":                      {"B":"B37", "C":"C37"},
-    "autres creanciers":                            {"B":"B38", "C":"C38"},
-    "comptes regularisation passif":                {"B":"B39", "C":"C39"},
-    "autres provisions risques charges":            {"B":"B40", "C":"C40"},
-    "ecarts conversion passif circulants":          {"B":"B41", "C":"C41"},
-    "credits escompte":                             {"B":"B44", "C":"C44"},
-    "credits tresorerie":                           {"B":"B45", "C":"C45"},
-    "banques soldes crediteurs":                    {"B":"B46", "C":"C46"},
-}
+RESULT_SKIP_RE = re.compile(
+    r'^(résultat d.exploitation|résultat financier|résultat courant(?!\s*\()|'
+    r'résultat non courant|résultat avant impôts|'
+    r'total i\b|total ii\b|total iii\b|total des |total général|'
+    r'produits d.exploitation$|charges d.exploitation$|'
+    r'charges financières?$|produits financiers?$|'
+    r'produits non courants?$|charges non courants?$)', re.I
+)
 
-CPC_CELL_MAP = {
-    "ventes marchandises etat":                     {"B":"B5",  "C":"C5",  "E":"E5"},
-    "ventes biens services":                        {"B":"B6",  "C":"C6",  "E":"E6"},
-    "chiffres affaires":                            {"B":"B6",  "C":"C6",  "E":"E6"},
-    "chiffre affaires":                             {"B":"B6",  "C":"C6",  "E":"E6"},
-    "variation stocks produits":                    {"B":"B8",  "C":"C8",  "E":"E8"},
-    "immobilisations produites entreprise":         {"B":"B9",  "C":"C9",  "E":"E9"},
-    "subventions exploitation":                     {"B":"B10", "C":"C10", "E":"E10"},
-    "autres produits exploitation":                 {"B":"B11", "C":"C11", "E":"E11"},
-    "reprises exploitation transferts":             {"B":"B12", "C":"C12", "E":"E12"},
-    "achats revendus marchandises":                 {"B":"B15", "C":"C15", "E":"E15"},
-    "achats consommes matieres":                    {"B":"B16", "C":"C16", "E":"E16"},
-    "autres charges externes":                      {"B":"B17", "C":"C17", "E":"E17"},
-    "impots taxes":                                 {"B":"B18", "C":"C18", "E":"E18"},
-    "charges personnel":                            {"B":"B19", "C":"C19", "E":"E19"},
-    "autres charges exploitation":                  {"B":"B20", "C":"C20", "E":"E20"},
-    "dotations exploitation":                       {"B":"B21", "C":"C21", "E":"E21"},
-    "produits titres participation":                {"B":"B25", "C":"C25", "E":"E25"},
-    "gains change":                                 {"B":"B26", "C":"C26", "E":"E26"},
-    "interets autres produits financiers":          {"B":"B27", "C":"C27", "E":"E27"},
-    "reprises financieres transferts":              {"B":"B28", "C":"C28", "E":"E28"},
-    "charges interets":                             {"B":"B31", "C":"C31", "E":"E31"},
-    "pertes change":                                {"B":"B32", "C":"C32", "E":"E32"},
-    "autres charges financieres":                   {"B":"B33", "C":"C33", "E":"E33"},
-    "dotations financieres":                        {"B":"B34", "C":"C34", "E":"E34"},
-    "produits cessions immobilisations":            {"B":"B39", "C":"C39", "E":"E39"},
-    "subventions equilibre":                        {"B":"B40", "C":"C40", "E":"E40"},
-    "reprises subventions investissement":          {"B":"B41", "C":"C41", "E":"E41"},
-    "autres produits courants":                     {"B":"B42", "C":"C42", "E":"E42"},
-    "reprises courantes transferts":                {"B":"B43", "C":"C43", "E":"E43"},
-    "valeurs nettes amort immobilisations":         {"B":"B46", "C":"C46", "E":"E46"},
-    "subventions accordees":                        {"B":"B47", "C":"C47", "E":"E47"},
-    "autres charges courantes":                     {"B":"B48", "C":"C48", "E":"E48"},
-    "dotations courantes amort provisions":         {"B":"B49", "C":"C49", "E":"E49"},
-    "impots benefices":                             {"B":"B53", "C":"C53", "E":"E53"},
-}
-
-# ─── Marqueurs de postes PASSIF uniquement ───────────────────────────────────
-# Si un label extrait dans la section actif contient l'un de ces marqueurs,
-# c'est une contamination de la page passif → skip
+# Labels passif uniquement (pour filtrer contaminations actif)
 PASSIF_ONLY_MARKERS = {
     'capitaux propres', 'capital social', 'capital appele',
     'prime emission', 'ecart reevaluation', 'reserve legale', 'reserves legales',
@@ -146,410 +61,537 @@ PASSIF_ONLY_MARKERS = {
     'provisions reglementees', 'dettes financement',
     'emprunts obligataires', 'provisions durables',
     'fournisseurs comptes rattaches passif', 'clients crediteurs avances passif',
-    'fournisseurs comptes rattaches',  # 'comptes rattaches' commun avec 'clients'
-    'fournisseurs et comptes rattaches',
-    'organismes sociaux', 'autres creanciers',
-    'comptes regularisation passif', 'autres provisions risques charges',
+    'autres creanciers', 'comptes regularisation passif',
+    'autres provisions risques charges',
     'credits escompte', 'credits tresorerie', 'banques soldes crediteurs',
-    'ecarts conversion passif e', 'ecarts conversion passif circulants',
-    'etat crediteur', 'etat - crediteur',  # passif circulant ne doit pas aller en actif
-}
-
-# ─── Labels de section/total → NE PAS injecter ───────────────────────────────
-# Testés via startswith(norm) pour attraper toutes les variantes
-
-NO_INJECT_STARTSWITH = (
-    # CPC : résultats calculés par formules
-    "resultat d exploitation",
-    "resultat financier",
-    "resultat courant",
-    "resultat non courant",
-    "resultat avant impots",
-    "resultat net xi",
-    "resultat net total",
-    # Totaux explicites
-    "total i ",  "total ii", "total iii", "total des ", "total general",
-    "total vii", "total viii",
-    # Sections sans cellules numériques
-    "charges non courant",
-    "produits non courant",
-    "produits d exploitation",
-    "charges d exploitation",
-    "charges financier",
-    "produits financier",
-    "capitaux propres assimil",
-    "dettes du passif circulant",
-)
-
-NO_INJECT_EXACT = {
-    "iii", "vii",
-    "dont verse",
-    "capital appele",
-    "immobilisations financieres d",
-    "stocks f",
-    "creances actif circulant g",
-    "total a b c d e",
-    "tresorerie actif",
-    "dettes passif circulant",
-    "total general i ii iii",
-    # Totaux CPC intermédiaires (calculés par formule)
-    "total iv", "total v", "total viii", "total ix",
-}
-
-# ─── Désambiguïsation contextuelle par mots entiers ──────────────────────────
-# Règle : le label normalisé doit CONTENIR le mot-clé comme mot entier
-# (pas comme sous-chaîne d'un autre mot)
-
-CONTEXT_WORD_RULES = {
-    # (mot_clé, section) → clé_dans_cell_map
-    # Un label "Personnel" seul → actif ou passif selon section
-    # Un label "Capital social ou Personnel" → capital social (pas personnel)
-    ("personnel", "actif"):  ("personnel actif circulant",  None),
-    ("personnel", "passif"): ("personnel passif",           None),
-    ("etat",      "actif"):  ("etat actif circulant",       None),
-    ("etat",      "passif"): ("etat passif",                None),
-    ("fournisseurs comptes rattaches", "passif"): ("fournisseurs comptes rattaches passif", None),
-    ("comptes regularisation",         "passif"): ("comptes regularisation passif",         None),
-    ("comptes associes",               "passif"): ("comptes associes passif",               None),
-    ("clients crediteurs",             "passif"): ("clients crediteurs avances passif",     None),
-}
-
-# Labels passif qui ont des alias spéciaux
-PASSIF_LABEL_MAP = {
-    # Aliases manquants SGTM
-    'clients crediteurs avances et acomptes':        'clients crediteurs avances passif',
-    'clients crediteurs avances acomptes':           'clients crediteurs avances passif',
-    'credit d escompte':                             'credits escompte',
-    'credit escompte':                               'credits escompte',
-    'credit de tresorerie':                          'credits tresorerie',
-    'banques soldes crediteurs passif':              'banques soldes crediteurs',
-    'reserves legales':                              'reserve legale',
-    'reports a nouveau':                             'report nouveau',
-    'reports a nouveau 2':                           'report nouveau',
-    'autre dettes de financement':                   'autres dettes financement',
-    'autre dettes financement':                      'autres dettes financement',
-    # label_normalisé_pdf → clé_dans_PASSIF_CELL_MAP
-    "capital social ou personnel 1":        "capital social",
-    "capital social ou personnel":          "capital social",
-    "resultat net de l exercice":           "resultat net exercice passif",
-    "resultat net de l exercice 2":         "resultat net exercice passif",
-    "subvention d investissement":          "subventions investissement passif",
-    "subventions d investissement":         "subventions investissement passif",
-    "subventions d invertissement":         "subventions investissement passif",
-    "resultat en instance d affectation":   "resultat instance affectation",
-    "resultats nets en instance d affectation":    "resultat instance affectation",
-    "resultats nets en instance d affectation 2":  "resultat instance affectation",
-    "report a nouveau 2":                   "report nouveau",
-    "reports a nouveau 2":                  "report nouveau",
-    "report a nouveau":                     "report nouveau",
-    "reports a nouveau":                    "report nouveau",
-    "fournisseurs et comptes rattaches":    "fournisseurs comptes rattaches passif",
-    "comptes de regularisation passif":     "comptes regularisation passif",
-    "autres provisions pour risques et charges g": "autres provisions risques charges",
-    "autres provisions pour risques et charges":   "autres provisions risques charges",
-    "resultat net de l exercice 2":         "resultat net exercice passif",
-    "prime d emission de fusion d apport":  "prime emission fusion",
-    "reserves legales":                     "reserve legale",
-    "organismes sociaux passif":            "organismes sociaux",
-}
-
-CPC_LABEL_MAP = {
-    # Labels avec 'de' que le fuzzy peut rater
-    "charges de personnel":                  "charges personnel",
-    "achats consommes de matieres et fournitures": "achats consommes matieres",
-    "achats consommes de matieres":          "achats consommes matieres",
-    "charges d interets":                    "charges interets",
-    "pertes de change":                      "pertes change",
-    "gains de change":                       "gains change",
-    "interets et autres produits fi":       "interets autres produits financiers",
-    "interets et autres produits financiers":"interets autres produits financiers",
-    "achats consommes 2 de matieres et fournitures": "achats consommes matieres",
-    "valeurs nettes d amortissements des immobilisations cedees": "valeurs nettes amort immobilisations",
-    "dotations non courantes aux amortissements et aux provisions": "dotations courantes amort provisions",
-    "reprises d exploitation transferts de charges": "reprises exploitation transferts",
-    "reprises non courantes transferts de charges": "reprises courantes transferts",
-    "reprises financieres transferts de charges": "reprises financieres transferts",
-    "achats revendus 2 de marchandises": "achats revendus marchandises",
-    "chiffres d affaires": "chiffres affaires",
-    "autres produits non courants": "autres produits courants",
-    "autres charges non courantes": "autres charges courantes",
+    'ecarts conversion passif',
+    'fournisseurs et comptes rattaches',
 }
 
 
-class TemplateInjector:
+class PDFParser:
 
-    def __init__(self, template_path: str):
-        self.template_path = template_path
+    def __init__(self, pdf_path: str):
+        self.path    = pdf_path
+        self.pdf     = pdfplumber.open(pdf_path)
+        self.pages   = self.pdf.pages
+        self.n_pages = len(self.pages)
+        logger.info(f"PDF chargé : {pdf_path} — {self.n_pages} pages")
 
-    def inject(self, extracted: dict, output_path: str) -> dict:
-        shutil.copy2(self.template_path, output_path)
-        wb = openpyxl.load_workbook(output_path)
-        stats = {"injected": 0, "not_found": []}
-
-        self._inject_info(wb, extracted.get("info", {}))
-
-        for section, ws_name, cell_map, col_order, label_map in [
-            ("actif",  "2 - Bilan Actif",  ACTIF_CELL_MAP,  ["B","C","E"], {}),
-            ("passif", "3 - Bilan Passif", PASSIF_CELL_MAP, ["B","C"],     PASSIF_LABEL_MAP),
-            ("cpc",    "4 - CPC",          CPC_CELL_MAP,    ["B","C","E"], CPC_LABEL_MAP),
-        ]:
-            key_name = f"{section}_values"
-            n = self._inject_section(
-                wb[ws_name],
-                extracted.get(key_name, {}),
-                cell_map,
-                section=section,
-                col_order=col_order,
-                label_map=label_map,
-            )
-            stats["injected"] += n["injected"]
-            stats["not_found"].extend(n["not_found"])
-
-        wb.save(output_path)
-        logger.info(f"Injection : {stats['injected']} valeurs · {len(stats['not_found'])} non mappés")
-        if stats["not_found"]:
-            logger.warning(f"Non mappés : {stats['not_found'][:8]}")
-        return stats
-
-    def _inject_info(self, wb, info: dict):
-        # Feuille 1 — Infos Générales
-        ws = wb["1 - Infos Générales"]
-        for row, key in {4:"raison_sociale", 5:"taxe_professionnelle",
-                         6:"identifiant_fiscal", 7:"adresse",
-                         8:"exercice", 9:"date_declaration"}.items():
-            v = info.get(key, "")
-            if v:
-                ws.cell(row=row, column=2).value = str(v)
-
-        # Mettre à jour les headers des autres feuilles
-        raison   = info.get("raison_sociale") or "—"
-        id_fisc  = info.get("identifiant_fiscal") or ""
-        exercice = info.get("exercice") or ""
-        sub_actif  = f"{raison}  —  IF: {id_fisc}" if id_fisc else raison
-        sub_passif = f"{raison}  —  IF: {id_fisc}" if id_fisc else raison
-        sub_cpc    = f"{raison}  —  Hors Taxes"
-
-        headers = {
-            "2 - Bilan Actif":  (f"BILAN — ACTIF  |  {exercice}",  sub_actif),
-            "3 - Bilan Passif": (f"BILAN — PASSIF  |  {exercice}", sub_passif),
-            "4 - CPC":          (f"COMPTE DE PRODUITS ET CHARGES  |  {exercice}", sub_cpc),
-            "5 - Tableau de Bord": (f"TABLEAU DE BORD — SYNTHÈSE FINANCIÈRE", raison),
+    def parse(self) -> dict:
+        result = {
+            "info":          self._parse_info(),
+            "actif_values":  self._extract_section(pages=[1, 2],    mode='actif'),
+            "passif_values": self._extract_section(pages=[2, 3],    mode='passif'),
+            "cpc_values":    self._extract_section(pages=[3, 4, 5], mode='cpc'),
         }
-        for sheet_name, (title, subtitle) in headers.items():
-            if sheet_name not in wb.sheetnames:
+        self._enrich_passif(result)
+        return result
+
+    # ── Infos générales ────────────────────────────────────────────────────────
+
+    def _parse_info(self) -> dict:
+        info = {}
+        text0 = self._page_text(0)
+
+        for key, pat in [
+            ("raison_sociale",       r"Raison\s+[Ss]ociale\s*[:\-]?\s*(.+)"),
+            ("taxe_professionnelle",  r"(?:Taxe|Art\.)\s+[Pp]rof[a-z.]*\s*[:\-]?\s*([\d\s]+)"),
+            ("identifiant_fiscal",    r"[Ii]dentifiant\s+[Ff]iscal\s*[:\-]?\s*(\d+)"),
+            ("adresse",               r"[Aa]dresse\s*[:\-]?\s*(.+)"),
+        ]:
+            m = re.search(pat, text0, re.IGNORECASE)
+            if m:
+                info[key] = m.group(1).strip()
+
+        # Fallback raison sociale
+        if not info.get("raison_sociale"):
+            for i in range(min(3, self.n_pages)):
+                t = self._page_text(i)
+                # Format DGI: "Raison Sociale : BEST BISCUITS MAROC"
+                m = re.search(r"Raison Sociale\s*[:\-]\s*([A-Z][^\n]{3,80})", t)
+                if m:
+                    info["raison_sociale"] = m.group(1).strip()
+                    break
+                # Format standard
+                m = re.search(r"((?:SOCIETE|SOCIÉTÉ|AGENCE|OFFICE|DIRECTION|S\.A\.|SARL|BEST|BORJ)[^\n]{3,80})", t)
+                if m:
+                    info["raison_sociale"] = m.group(1).strip()
+                    break
+
+        # Identifiant fiscal fallback
+        if not info.get("identifiant_fiscal"):
+            for line in text0.split('\n'):
+                if re.match(r'^\d{6,10}$', line.strip()):
+                    info["identifiant_fiscal"] = line.strip()
+                    break
+
+        # Exercice
+        for i in range(min(3, self.n_pages)):
+            t = self._page_text(i)
+            m = re.search(r"(\d{2}/\d{2}/\d{4})\s+au\s+(\d{2}/\d{2}/\d{4})", t)
+            if not m:
+                m = re.search(r"(?:période du|au titre de la période du|du\s*:?\s*)(\d{2}/\d{2}/\d{4})\s+(?:au|AU)\s*:?\s*(\d{2}/\d{2}/\d{4})", t, re.I)
+            if m:
+                info["exercice"]       = f"Du {m.group(1)} au {m.group(2)}"
+                info["exercice_debut"] = m.group(1)
+                info["exercice_fin"]   = m.group(2)
+                break
+
+        # Date déclaration
+        for i in range(min(2, self.n_pages)):
+            t = self._page_text(i)
+            m = re.search(r"(?:le\s+)?(\d{2}/\d{2}/\d{4})\s+\d{2}:\d{2}", t)
+            if not m:
+                m = re.search(r"[Ll]e\s+(\d{2}/\d{2}/\d{4})", t)
+            if m:
+                info["date_declaration"] = m.group(1)
+                break
+
+        for k in ["exercice", "exercice_fin", "exercice_debut", "date_declaration",
+                  "raison_sociale", "identifiant_fiscal", "adresse", "taxe_professionnelle"]:
+            info.setdefault(k, "")
+        info["pages"] = self.n_pages
+        return info
+
+    # ── Extraction universelle ─────────────────────────────────────────────────
+
+    def _extract_section(self, pages: list, mode: str) -> dict:
+        values = {}
+        for page_idx in pages:
+            if page_idx >= self.n_pages:
                 continue
-            ws2 = wb[sheet_name]
-            ws2.cell(row=1, column=1).value = title
-            ws2.cell(row=2, column=1).value = subtitle
-
-    def _inject_section(self, ws, values: dict, cell_map: dict,
-                        section: str, col_order: list,
-                        label_map: dict) -> dict:
-        injected = 0
-        not_found = []
-        idx = build_index(cell_map)
-        passif_idx = build_index(PASSIF_CELL_MAP)
-
-        for raw_label, vals in values.items():
-            norm = normalize(raw_label)
-
-            # ── Filtres NO_INJECT ──
-            if norm in NO_INJECT_EXACT:
+            text = self._page_text(page_idx)
+            if not self._page_matches_mode(text, mode):
                 continue
-            if any(norm.startswith(p) for p in NO_INJECT_STARTSWITH):
+            page_values = self._extract_page(page_idx, mode)
+            for label, vals in page_values.items():
+                if label not in values:
+                    values[label] = vals
+                else:
+                    # Enrichir avec valeurs manquantes
+                    ex = values[label]
+                    ml = max(len(ex), len(vals))
+                    merged = []
+                    for i in range(ml):
+                        ev = ex[i]   if i < len(ex)   else None
+                        nv = vals[i] if i < len(vals) else None
+                        merged.append(ev if ev is not None else nv)
+                    values[label] = merged
+
+        logger.info(f"{mode}: {len(values)} postes extraits")
+        return values
+
+    def _page_matches_mode(self, text: str, mode: str) -> bool:
+        t = text.lower()
+        if mode == 'actif':
+            return any(k in t for k in ['actif', 'immobilisations', 'stocks', 'créances', 'bilan'])
+        if mode == 'passif':
+            return any(k in t for k in ['passif', 'capitaux propres', 'capital', 'dettes'])
+        if mode == 'cpc':
+            return any(k in t for k in ['produits', 'charges', 'exploitation', 'résultat', 'compte de'])
+        return True
+
+    def _extract_page(self, page_idx: int, mode: str) -> dict:
+        page  = self.pages[page_idx]
+        words = page.extract_words(x_tolerance=3, y_tolerance=3)
+        if not words:
+            return {}
+
+        # Regrouper par Y (tolérance 6pt)
+        lines = defaultdict(list)
+        for w in words:
+            lines[round(w['top'] / 6) * 6].append(w)
+
+        # Détecter le seuil label/nombre
+        num_xs = [w['x0'] for w in words
+                  if self._is_num_token(w['text']) and w['x0'] > 150]
+        if not num_xs:
+            return {}
+
+        label_thresh = min(num_xs) - 10
+
+        # Détecter les colonnes
+        col_xs = self._detect_columns(num_xs)
+
+        result = {}
+        prev_label = None  # Pour les labels sur ligne sans valeur (DGI)
+
+        for y in sorted(lines.keys()):
+            row = sorted(lines[y], key=lambda w: w['x0'])
+
+            # Reconstituer le label (gérer fragments DGI)
+            label_words = [w for w in row if w['x0'] < label_thresh]
+            label = self._reconstruct_label(label_words)
+
+            # Tokens numériques
+            num_words = [(w['x0'], w['x1'], w['text']) for w in row
+                        if w['x0'] >= label_thresh and self._is_num_token(w['text'])]
+
+            if not label and not num_words:
                 continue
 
-            # ── Filtre anti-contamination actif ──
-            if section == "actif":
-                brut = vals[0] if vals else None
-                # 1) Si le label correspond à un poste passif → toujours skip (contamination)
-                if any(marker in norm for marker in PASSIF_ONLY_MARKERS):
-                    continue
-                # 2) Si Brut=None → pas de valeur actif utile → skip
-                if brut is None:
-                    continue
-
-            # ── Résolution du label ──
-            key = self._resolve_label(norm, section, idx, cell_map, label_map)
-
-            if not key:
-                not_found.append(raw_label[:45])
+            if label and not num_words:
+                # Ligne avec label seulement → mémoriser pour la ligne suivante (DGI)
+                prev_label = label
                 continue
 
-            # ── Injection ──
-            refs = cell_map[key]
-            for i, col in enumerate(col_order):
-                if col in refs and i < len(vals) and vals[i] is not None:
-                    r = int(refs[col][1:])
-                    c = ord(refs[col][0]) - 64
-                    ws.cell(row=r, column=c).value = vals[i]
-                    injected += 1
+            if not label and num_words and prev_label:
+                # Ligne avec valeurs sans label → utiliser le label précédent
+                label = prev_label
+                prev_label = None
+            elif label and num_words:
+                prev_label = None
 
-        return {"injected": injected, "not_found": not_found}
+            if not label:
+                continue
 
-    def _resolve_label(self, norm: str, section: str,
-                       idx: dict, cell_map: dict, label_map: dict) -> str | None:
+            if not self._is_valid_label(label, mode):
+                continue
+
+            # Fusionner et parser les nombres
+            merged = self._merge_and_parse_nums(num_words)
+            if not merged:
+                continue
+
+            # Assigner aux colonnes
+            vals = self._assign_to_cols(merged, col_xs, mode)
+
+            if any(v is not None for v in vals):
+                result[label] = vals
+
+        return result
+
+    # ── Détection des colonnes ─────────────────────────────────────────────────
+
+    def _detect_columns(self, num_xs: list) -> list:
+        if not num_xs:
+            return []
+        hist = Counter([round(x / 5) * 5 for x in num_xs])
+        significant = sorted([(k, v) for k, v in hist.items() if v >= 2])
+        if not significant:
+            return []
+
+        cols = []
+        grp = [significant[0]]
+        for x, c in significant[1:]:
+            if x - grp[-1][0] < 25:
+                grp.append((x, c))
+            else:
+                total_x = sum(xi * ci for xi, ci in grp)
+                total_c = sum(ci for _, ci in grp)
+                cols.append(total_x / total_c)
+                grp = [(x, c)]
+        total_x = sum(xi * ci for xi, ci in grp)
+        total_c = sum(ci for _, ci in grp)
+        cols.append(total_x / total_c)
+        return sorted(cols)
+
+    # ── Assignation des colonnes ───────────────────────────────────────────────
+
+    def _assign_to_cols(self, merged: list, col_xs: list, mode: str) -> list:
         """
-        Résout un label normalisé en clé du cell_map.
-        Ordre de priorité :
-          1. label_map direct (alias explicites)
-          2. Règles contextuelles par mot entier
-          3. Correspondance exacte dans idx
-          4. Fuzzy match (seuil 0.45)
+        Assigne les valeurs aux colonnes attendues.
+        Actif  : 4 cols idéalement → retourne [brut, amort, net_n1]
+        Passif : 2 cols → retourne [val_n, val_n1]
+        CPC    : 4 cols idéalement → retourne [propre_n, prec_n, total_n1]
         """
-        # 1. Alias explicite
-        if norm in label_map:
-            return label_map[norm]
+        if not col_xs or not merged:
+            return [v for _, v in merged]
 
-        # 2. Règles contextuelles (mot entier uniquement)
-        norm_words = set(re.findall(r'\b\w+\b', norm))
-        for (kw, sec), (mapped_key, _) in CONTEXT_WORD_RULES.items():
-            if sec == section:
-                kw_words = set(re.findall(r'\b\w+\b', kw))
-                # Tous les mots du mot-clé doivent être dans norm
-                # ET norm ne doit pas contenir d'autres qualificatifs qui changent le sens
-                if kw_words.issubset(norm_words):
-                    # Vérifier que le label n'est pas plus spécifique (ex: "capital social ou personnel")
-                    if mapped_key in cell_map:
-                        # Exclure si label contient des mots indicatifs d'un autre poste
-                        exclude_if = {
-                            ("personnel", "passif"): {"capital", "social"},
-                            ("etat",      "passif"): {"capital", "social"},
-                            ("etat",      "actif"):  {"capital", "social"},
-                        }
-                        excl = exclude_if.get((kw, sec), set())
-                        if not excl.intersection(norm_words):
-                            return mapped_key
+        n_cols = len(col_xs)
 
-        # 3. Exact
-        if norm in idx:
-            return idx[norm]
+        # Créer le mapping col_index → valeur
+        col_map = {}
+        for x, v in merged:
+            closest = min(range(n_cols), key=lambda i: abs(col_xs[i] - x))
+            col_map[closest] = v
 
-        # 4. Fuzzy
-        return find_key_fuzzy(norm, idx, cell_map)
+        filled = {k: v for k, v in col_map.items() if v is not None}
 
+        if mode == 'actif':
+            if n_cols >= 4:
+                # Vérifier si les 2 premières cols sont vides (PDF sans amort)
+                if not filled.get(0) and not filled.get(1):
+                    return [filled.get(2), None, filled.get(3)]
+                # Déterminer l'ordre : Brut|Amort|Net|NetN1 (standard)
+                #                   ou Brut|Net|Amort|NetN1 (SGTM)
+                # Règle mathématique : Brut = col1 + col2 toujours
+                # Si col1 == Brut → Net=Brut, Amort=0=col2
+                # Sinon Amort = max(col1, col2) sauf si égaux
+                c0 = col_map.get(0)   # Brut
+                c1 = col_map.get(1)   # Amort ou Net selon format
+                c2 = col_map.get(2)   # Net ou Amort selon format
+                c3 = col_map.get(3)   # Net N-1
+                if c1 is not None and c2 is not None:
+                    if c1 == c0:      # Net = Brut → Amort = 0 = c2
+                        amort = c2
+                    elif c2 == c0:    # rare
+                        amort = c1
+                    else:
+                        amort = max(c1, c2) if c1 != c2 else min(c1, c2)
+                else:
+                    amort = c1
+                return [c0, amort, c3]
+            elif n_cols == 3:
+                c0 = col_map.get(0)
+                c1 = col_map.get(1)
+                c2 = col_map.get(2)
+                # Si c0==c1 → Net=Brut → Amort=0, NetN1=c2
+                if c0 is not None and c1 is not None and c0 == c1:
+                    return [c0, 0.0, c2]
+                # Calculer les gaps entre colonnes
+                gaps = [col_xs[i+1] - col_xs[i] for i in range(n_cols-1)]
+                if len(gaps) >= 2 and gaps[0] > gaps[1] * 1.5:
+                    return [c0, None, c2]
+                else:
+                    return [c0, c1, c2]
+            elif n_cols == 2:
+                return [col_map.get(0), None, col_map.get(1)]
+            else:
+                return [v for _, v in merged]
 
-# ─── Utilitaires ──────────────────────────────────────────────────────────────
+        elif mode == 'passif':
+            if n_cols >= 4:
+                # Vérifier si les 2 premières cols sont vides
+                if not filled.get(0) and not filled.get(1):
+                    return [filled.get(2), filled.get(3)]
+                # Passif n'a que 2 valeurs: prendre les 2 dernières
+                sorted_filled = sorted(filled.items())
+                if len(sorted_filled) >= 2:
+                    return [sorted_filled[-2][1], sorted_filled[-1][1]]
+                return [col_map.get(n_cols-2), col_map.get(n_cols-1)]
+            elif n_cols >= 2:
+                sorted_filled = sorted(filled.items())
+                if len(sorted_filled) >= 2:
+                    return [sorted_filled[-2][1], sorted_filled[-1][1]]
+                elif len(sorted_filled) == 1:
+                    return [sorted_filled[0][1], None]
+                return [col_map.get(0), col_map.get(1)]
+            else:
+                return [v for _, v in merged]
 
-def normalize(s: str) -> str:
-    s = str(s).lower().strip()
-    for k, v in {"é":"e","è":"e","ê":"e","à":"a","â":"a","ô":"o","û":"u",
-                 "î":"i","ç":"c","œ":"oe","ë":"e","ï":"i","ù":"u","ü":"u"}.items():
-        s = s.replace(k, v)
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+        elif mode == 'cpc':
+            if n_cols >= 4:
+                if not filled.get(0) and not filled.get(1) and (filled.get(2) or filled.get(3)):
+                    return [filled.get(2), None, filled.get(3)]
+                return [col_map.get(0), col_map.get(1), col_map.get(3)]
+            elif n_cols >= 3:
+                return [col_map.get(0), col_map.get(1), col_map.get(2)]
+            elif n_cols == 2:
+                return [col_map.get(0), None, col_map.get(1)]
+            else:
+                return [v for _, v in merged]
 
+        return [v for _, v in merged]
 
-def keywords(s: str) -> set:
-    stop = {"les","des","de","du","et","en","sur","par","pour","aux","une","un",
-            "la","le","au","ou","est","sont","ne","se","dont","avec","sans",
-            "dans","sous","vers","non","plus","a","b","c","d","e","f","g","h",
-            "i","j","par","au","aux","en","sur","pour","et","ou"}
-    return {w for w in re.findall(r"[a-z]{3,}", s) if w not in stop}
+    # ── Reconstruction du label ────────────────────────────────────────────────
 
+    def _reconstruct_label(self, label_words: list) -> str:
+        """
+        Reconstruction robuste du label pour tous les formats PDF.
 
-def build_index(cell_map: dict) -> dict:
-    return {normalize(k): k for k in cell_map}
+        Règles:
+        - Filtrer les préfixes parasites (*, numéros de compte, lettres rotatives)
+        - Si deux groupes séparés par gap > 8pt → prendre le DERNIER (closest to nums)
+        - gap ≤ 1pt → coller directement (même mot fragmenté: 'I'+'m'+'mobilisations')
+        - gap 1-8pt → ajouter espace (mots distincts)
+        """
+        if not label_words:
+            return ""
 
+        # Filtrer les préfixes parasites
+        filtered = []
+        for w in label_words:
+            t = w['text']
+            # Ignorer * et numéros de compte (211, 212, 311...)
+            if t == '*' or re.match(r'^\d{3}$', t):
+                continue
+            # Ignorer les lettres isolées rotatives uniquement si très à gauche (x<50)
+            if len(t) <= 2 and re.match(r'^[A-Z.]+$', t) and w['x0'] < 50:
+                continue
+            filtered.append(w)
 
-def find_key(norm: str, index: dict, cell_map: dict) -> str | None:
-    if norm in index:
-        return index[norm]
-    return find_key_fuzzy(norm, index, cell_map)
+        if not filtered:
+            return ""
 
+        # Détecter les blocs séparés par grand gap (>8pt)
+        # Prendre le DERNIER bloc (le plus proche des colonnes numériques)
+        blocks = [[filtered[0]]]
+        for i in range(1, len(filtered)):
+            gap = filtered[i]['x0'] - filtered[i-1]['x1']
+            if gap > 8:
+                blocks.append([])
+            blocks[-1].append(filtered[i])
 
-def find_key_fuzzy(norm: str, index: dict, cell_map: dict,
-                   threshold: float = 0.45) -> str | None:
-    norm_kw = keywords(norm)
-    if not norm_kw:
-        return None
-    best, best_score = None, 0
-    for k_norm, k_orig in index.items():
-        k_kw = keywords(k_norm)
-        if not k_kw:
-            continue
-        common = norm_kw & k_kw
-        score = len(common) / max(len(norm_kw), len(k_kw))
-        if score > best_score and score >= threshold:
-            best_score = score
-            best = k_orig
-    return best
+        last_block = next((b for b in reversed(blocks) if b), [])
+        if not last_block:
+            return ""
 
-# ── ALIAS UNIVERSELS — variantes entre PDFs ───────────────────────────────────
+        # Reconstruction du texte du bloc
+        # gap ≤ 0.2pt → vrai fragment du même mot → coller sans espace
+        # gap >  0.2pt → mots séparés → ajouter espace
+        # Exemples: DGI 'I'(0pt)'m'(0pt)'mobilisations' → 'Immobilisations'
+        #           SAPST 'Frais'(0.95pt)'Préliminaires' → 'Frais Préliminaires'
+        result = last_block[0]['text']
+        for i in range(1, len(last_block)):
+            gap = last_block[i]['x0'] - last_block[i-1]['x1']
+            if gap <= 0.2:
+                result += last_block[i]['text']    # coller: vrais fragments
+            else:
+                result += ' ' + last_block[i]['text']  # espace: mots distincts
 
-ACTIF_CELL_MAP.update({
-    # Variantes orthographiques PDF2
-    "immobilisations non valeurs":              {"B":"B5",  "C":"C5",  "E":"E5"},
-    "primes remboursement obligations":         {"B":"B8",  "C":"C8",  "E":"E8"},
-    "immobilisation incorporelle":              {"B":"B9",  "C":"C9",  "E":"E9"},
-    "brevet marques droit valeurs":             {"B":"B11", "C":"C11", "E":"E11"},
-    "mobilier materiel bureau amenagement":     {"B":"B19", "C":"C19", "E":"E19"},
-    "immobilisations financieres":              {"B":"B22", "C":"C22", "E":"E22"},
-    "augmentations dettes financement":         {"B":"B29", "C":"C29", "E":"E29"},
-    "banque tg ccp":                            {"B":"B51", "C":"C51", "E":"E51"},
-    "caisses regies avances accreditifs":       {"B":"B52", "C":"C52", "E":"E52"},
-})
+        # Nettoyages finaux
+        result = re.sub(r'\s+', ' ', result).strip()
+        result = result.strip('[]()- \t*')
+        result = re.sub(r'^[A-Z]\s*\.\s*[A-Z]?\s*\.?\s*', '', result)  # A.I., F., etc.
+        result = re.sub(r'^\d{3}\s*', '', result)  # codes de compte résiduels
 
-PASSIF_CELL_MAP.update({
-    # Variantes PDF2
-    "reserves legales":                         {"B":"B11", "C":"C11"},
-    "reports nouveau":                          {"B":"B13", "C":"C13"},
-    "report nouveau 2":                         {"B":"B13", "C":"C13"},
-    "resultats nets instance affectation":      {"B":"B14", "C":"C14"},
-    "resultats nets en instance affectation 2": {"B":"B14", "C":"C14"},
-    "subventions invertissement":               {"B":"B18", "C":"C18"},
-    "autre dettes financement":                 {"B":"B22", "C":"C22"},
-    "credit tresorerie":                        {"B":"B45", "C":"C45"},
-    "banques soldes crediteurs passif":         {"B":"B46", "C":"C46"},
-    "diminution dettes financement passif":     {"B":"B28", "C":"C28"},
-    # Labels passif qui arrivent aussi depuis actif_values
-    "prime emission fusion apport":             {"B":"B9",  "C":"C9"},
-    "prime d emission de fusion d apport":      {"B":"B9",  "C":"C9"},
-})
+        return result.strip()
 
-CPC_CELL_MAP.update({
-    # Variantes PDF2 — "pour elle-même" tronqué
-    "immobilisations produites entreprise meme": {"B":"B9",  "C":"C9",  "E":"E9"},
-    "immobilisations produites e se":            {"B":"B9",  "C":"C9",  "E":"E9"},
-})
+    # ── Parsing numérique universel ────────────────────────────────────────────
 
-# ── Labels à NE PAS injecter (totaux calculés par formule) ───────────────────
+    @staticmethod
+    def _is_num_token(t: str) -> bool:
+        """Reconnaît tous les tokens numériques: standard, points-milliers SAPST, †."""
+        t2 = t.replace('†', '').replace(' ', '')
+        return bool(re.match(
+            r'^-?\d{1,3}$'
+            r'|^-?\d+[,\.]\d{2}$'
+            r'|^-?\d+(\.\d+)+[,\.]\d{2}$'
+            r'|^\.(\d+\.)*\d+[,\.]\d{2}$'
+            r'|^-?0,00$', t2
+        ))
+    @staticmethod
+    def _parse_num_str(s: str) -> float | None:
+        """Parse un nombre depuis une chaîne reconstituée."""
+        if not s:
+            return None
+        neg = s.startswith('-')
+        s = s.lstrip('-').replace('†', '').replace(' ', '')
 
-NO_INJECT_STARTSWITH = (
-    # CPC
-    "resultat d exploitation", "resultat financier",
-    "resultat courant", "resultat non courant", "resultat avant impots",
-    "resultat net xi", "resultat net total",
-    # Totaux
-    "total i ", "total ii", "total iii", "total des ", "total general",
-    "total vii", "total viii", "total f g h", "total a b c d e",
-    "total f g h i",
-    # Sections sans cellules
-    "charges non courant", "produits non courant",
-    "produits d exploitation", "charges d exploitation",
-    "charges financier", "produits financier",
-    "capitaux propres assimil", "dettes du passif circulant",
-    "dettes passif circulant",
-    "immobilisations non valeurs",  # sous-total calculé
-    "immobilisation incorporelle",  # sous-total calculé
-    "immobilisations financieres",  # sous-total calculé
-    "stocks",  # sous-total calculé
-    "creances actif circulant",
-    "tresorerie actif", "tresorerie passif",
-    "total des capitaux propres",
-    "capitaux propres assimiles",
-    "provisions durables",
-)
+        # Format SAPST avec points comme milliers: 1.500.000.000,00 ou 7.092.363,69
+        if re.match(r'^\d+(\.\d+)+[,\.]\d{2}$', s):
+            # Supprimer tous les points (séparateurs milliers), garder la virgule décimale
+            parts = re.split(r'[,\.]', s)
+            integer_part = ''.join(parts[:-1])
+            decimal_part = parts[-1]
+            s = f"{integer_part}.{decimal_part}"
+        elif re.match(r'^(\.\d+)+[,\.]\d{2}$', s):
+            # Partiel SAPST: .500.000.000,00 (premier digit séparé)
+            parts = re.split(r'[,\.]', s.lstrip('.'))
+            integer_part = ''.join(p for p in parts[:-1] if p)
+            decimal_part = parts[-1]
+            s = f"{integer_part}.{decimal_part}" if integer_part else f"0.{decimal_part}"
+        else:
+            s = s.replace(',', '.')
 
-NO_INJECT_EXACT = {
-    "iii", "vii", "total", "xiv total des produits", "xvi resultat net",
-    "dont verse", "capital appele", "total general iii",
-    "total a b c d e", "stocks f", "creances actif circulant g",
-    "total f g h i", "total f g h",
-    "tresorerie actif", "dettes passif circulant",
-    "total general i ii iii",
-    "vii vii resultat courant reports",
-    "xvi charges",  # BORJ: XVI RESULTAT NET mal parsé → bloque contamination B19
-    "xvi",          # idem
-}
+        try:
+            v = float(s)
+            return -v if neg else v
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _merge_and_parse_nums(words_with_bounds: list) -> list:
+        """
+        Fusionne les tokens numériques adjacents (gap < 6pt) et les parse.
+        Gère tous les formats: espace-milliers, points-milliers (SAPST), †.
+        Retourne [(x0, float), ...]
+        """
+        if not words_with_bounds:
+            return []
+
+        groups, grp = [], [words_with_bounds[0]]
+        for i in range(1, len(words_with_bounds)):
+            px0, px1, pt = grp[-1]
+            cx0, cx1, ct = words_with_bounds[i]
+            gap = cx0 - px1
+
+            pt_clean = pt.replace('†', '')
+            ct_clean = ct.replace('†', '')
+            both_num = PDFParser._is_num_token(pt) and PDFParser._is_num_token(ct)
+
+            # Fusionner si gap < 6pt ET les deux sont numériques
+            # OU si c'est un format SAPST: digit seul suivi de '7.092.363,69'
+            is_sapst = (re.match(r'^\d$', pt_clean) and
+                        re.match(r'^\d+\.\d+[,\.]\d{2}$|^\.\d+[,\.]\d{2}$', ct_clean) and
+                        gap < 8)
+
+            if (both_num and gap < 6) or is_sapst:
+                grp.append((cx0, cx1, ct))
+            else:
+                groups.append(grp)
+                grp = [(cx0, cx1, ct)]
+        groups.append(grp)
+
+        result = []
+        for g in groups:
+            neg = any(t.replace('†', '').startswith('-') for _, _, t in g)
+            raw = ''.join(t for _, _, t in g)
+            if neg:
+                raw = '-' + raw.lstrip('-')
+            v = PDFParser._parse_num_str(raw)
+            if v is not None:
+                result.append((g[0][0], v))
+
+        return result
+
+    # ── Validité des labels ────────────────────────────────────────────────────
+
+    def _is_valid_label(self, label: str, mode: str) -> bool:
+        if not label or len(label) < 3:
+            return False
+        l = label.lower().strip()
+        if l in SKIP_SINGLE:
+            return False
+        if SKIP_LABELS_RE.match(l):
+            return False
+        if mode == 'cpc' and RESULT_SKIP_RE.match(l):
+            return False
+        if re.match(r'^\d+$', label):
+            return False
+        return True
+
+    # ── Enrichissement passif ──────────────────────────────────────────────────
+
+    def _enrich_passif(self, data: dict):
+        pv  = data["passif_values"]
+        cpc = data["cpc_values"]
+
+        # 1. Résultat net depuis CPC
+        rn_key = "Résultat net de l'exercice"
+        if rn_key not in pv:
+            for k, v in cpc.items():
+                if re.search(r'resultat net.*xi|resultat net.*xi-xii', k, re.I):
+                    propre   = v[0] or 0
+                    prec     = v[1] or 0
+                    total_n  = round(propre + prec, 2)
+                    total_n1 = v[2] if len(v) > 2 else None
+                    pv[rn_key] = [total_n, total_n1]
+                    logger.info(f"Résultat net inféré : N={total_n} N-1={total_n1}")
+                    break
+
+        # 2. Capital social: chercher sous libellés alternatifs
+        capital_keys = ["Capital social ou personnel", "Capital social ou personnel (1)"]
+        if not any(k in pv for k in capital_keys):
+            for k, v in list(pv.items()):
+                kl = k.lower()
+                if any(x in kl for x in ["capital appelé", "dont versé", "capital appele"]):
+                    if v and v[0] and v[0] > 0:
+                        pv["Capital social ou personnel"] = v
+                        logger.info(f"Capital social inféré : {v}")
+                        break
+
+    # ── Utilitaires ────────────────────────────────────────────────────────────
+
+    def _page_text(self, idx: int) -> str:
+        if idx >= self.n_pages:
+            return ""
+        return self.pages[idx].extract_text() or ""
+
+    def __del__(self):
+        try:
+            self.pdf.close()
+        except Exception:
+            pass
