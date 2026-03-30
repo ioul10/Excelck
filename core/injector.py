@@ -216,6 +216,18 @@ CONTEXT_WORD_RULES = {
 
 # Labels passif qui ont des alias spéciaux
 PASSIF_LABEL_MAP = {
+    # Aliases manquants SGTM
+    'clients crediteurs avances et acomptes':        'clients crediteurs avances passif',
+    'clients crediteurs avances acomptes':           'clients crediteurs avances passif',
+    'credit d escompte':                             'credits escompte',
+    'credit escompte':                               'credits escompte',
+    'credit de tresorerie':                          'credits tresorerie',
+    'banques soldes crediteurs passif':              'banques soldes crediteurs',
+    'reserves legales':                              'reserve legale',
+    'reports a nouveau':                             'report nouveau',
+    'reports a nouveau 2':                           'report nouveau',
+    'autre dettes de financement':                   'autres dettes financement',
+    'autre dettes financement':                      'autres dettes financement',
     # label_normalisé_pdf → clé_dans_PASSIF_CELL_MAP
     "capital social ou personnel 1":        "capital social",
     "capital social ou personnel":          "capital social",
@@ -300,6 +312,7 @@ class TemplateInjector:
         return stats
 
     def _inject_info(self, wb, info: dict):
+        # Feuille 1 — Infos Générales
         ws = wb["1 - Infos Générales"]
         for row, key in {4:"raison_sociale", 5:"taxe_professionnelle",
                          6:"identifiant_fiscal", 7:"adresse",
@@ -307,6 +320,27 @@ class TemplateInjector:
             v = info.get(key, "")
             if v:
                 ws.cell(row=row, column=2).value = str(v)
+
+        # Mettre à jour les headers des autres feuilles
+        raison   = info.get("raison_sociale") or "—"
+        id_fisc  = info.get("identifiant_fiscal") or ""
+        exercice = info.get("exercice") or ""
+        sub_actif  = f"{raison}  —  IF: {id_fisc}" if id_fisc else raison
+        sub_passif = f"{raison}  —  IF: {id_fisc}" if id_fisc else raison
+        sub_cpc    = f"{raison}  —  Hors Taxes"
+
+        headers = {
+            "2 - Bilan Actif":  (f"BILAN — ACTIF  |  {exercice}",  sub_actif),
+            "3 - Bilan Passif": (f"BILAN — PASSIF  |  {exercice}", sub_passif),
+            "4 - CPC":          (f"COMPTE DE PRODUITS ET CHARGES  |  {exercice}", sub_cpc),
+            "5 - Tableau de Bord": (f"TABLEAU DE BORD — SYNTHÈSE FINANCIÈRE", raison),
+        }
+        for sheet_name, (title, subtitle) in headers.items():
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws2 = wb[sheet_name]
+            ws2.cell(row=1, column=1).value = title
+            ws2.cell(row=2, column=1).value = subtitle
 
     def _inject_section(self, ws, values: dict, cell_map: dict,
                         section: str, col_order: list,
