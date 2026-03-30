@@ -11,8 +11,14 @@ Camelot Lattice détecte les bordures du tableau → 100% accuracy.
 """
 
 import re
-import camelot
 from utils.logger import get_logger
+
+# Import conditionnel — camelot nécessite ghostscript système
+try:
+    import camelot
+    CAMELOT_AVAILABLE = True
+except ImportError:
+    CAMELOT_AVAILABLE = False
 
 logger = get_logger(__name__)
 
@@ -62,6 +68,12 @@ class DGIParser:
             return 7
 
     def parse(self) -> dict:
+        if not CAMELOT_AVAILABLE:
+            raise ImportError(
+                "Camelot non installé. Mode DGI nécessite : "
+                "pip install camelot-py[cv] "
+                "et ghostscript (apt/brew install ghostscript)"
+            )
         result = {
             "info":          self._parse_info(),
             "actif_values":  self._parse_actif(),
