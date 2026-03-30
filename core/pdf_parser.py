@@ -314,16 +314,38 @@ class PDFParser:
                 # Vérifier si les 2 premières cols sont vides (PDF sans amort)
                 if not filled.get(0) and not filled.get(1):
                     return [filled.get(2), None, filled.get(3)]
-                return [col_map.get(0), col_map.get(1), col_map.get(3)]
+                # Déterminer l'ordre : Brut|Amort|Net|NetN1 (standard)
+                #                   ou Brut|Net|Amort|NetN1 (SGTM)
+                # Règle mathématique : Brut = col1 + col2 toujours
+                # Si col1 == Brut → Net=Brut, Amort=0=col2
+                # Sinon Amort = max(col1, col2) sauf si égaux
+                c0 = col_map.get(0)   # Brut
+                c1 = col_map.get(1)   # Amort ou Net selon format
+                c2 = col_map.get(2)   # Net ou Amort selon format
+                c3 = col_map.get(3)   # Net N-1
+                if c1 is not None and c2 is not None:
+                    if c1 == c0:      # Net = Brut → Amort = 0 = c2
+                        amort = c2
+                    elif c2 == c0:    # rare
+                        amort = c1
+                    else:
+                        amort = max(c1, c2) if c1 != c2 else min(c1, c2)
+                else:
+                    amort = c1
+                return [c0, amort, c3]
             elif n_cols == 3:
+                c0 = col_map.get(0)
+                c1 = col_map.get(1)
+                c2 = col_map.get(2)
+                # Si c0==c1 → Net=Brut → Amort=0, NetN1=c2
+                if c0 is not None and c1 is not None and c0 == c1:
+                    return [c0, 0.0, c2]
                 # Calculer les gaps entre colonnes
                 gaps = [col_xs[i+1] - col_xs[i] for i in range(n_cols-1)]
                 if len(gaps) >= 2 and gaps[0] > gaps[1] * 1.5:
-                    # Grande distance 0→1, petite 1→2 → cols 1,2,3 = brut, net_n, net_n1
-                    return [col_map.get(0), None, col_map.get(2)]
+                    return [c0, None, c2]
                 else:
-                    # Brut, amort, net_n (pas de net_n1)
-                    return [col_map.get(0), col_map.get(1), col_map.get(2)]
+                    return [c0, c1, c2]
             elif n_cols == 2:
                 return [col_map.get(0), None, col_map.get(1)]
             else:
