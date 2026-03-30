@@ -1,505 +1,675 @@
 """
-core/pdf_to_excel.py — Extraction PDF fiscal → Excel
-Approche hybride :
-  1. extract_tables() si le PDF a des bordures claires (Bilan2017, BORJ)
-  2. extract_words() + X/Y si pas de tableau structuré (SGTM, SAPST)
-Aucun mapping, aucun template — miroir fidèle du PDF.
+core/pdf_to_excel.py
+Extraction PDF fiscal → Excel structuré et formaté professionnellement.
+Détecte automatiquement les sections (Actif / Passif / CPC) par mots-clés.
+Compatible avec tous les formats MCN loi 9-88 Maroc.
 """
 
-import re, unicodedata
-from collections import defaultdict
+import re
+import unicodedata
 import pdfplumber
 import openpyxl
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from utils.logger import get_logger
 
-logger = get_logger(__name__)
+# ── Palette couleurs ──────────────────────────────────────────────────────────
+C_DARK_BLUE  = "1F3864"
+C_MED_BLUE   = "2E75B6"
+C_LIGHT_BLUE = "BDD7EE"
+C_SECTION    = "D6E4F0"
+C_SUBTOTAL   = "EBF3FB"
+C_RESULT     = "2E4057"
+C_WHITE      = "FFFFFF"
+C_GRAY_BG    = "F5F7FA"
+C_BORDER     = "B8CCE4"
 
-# ── Couleurs ──────────────────────────────────────────────────────────────────
-C_DARK   = "1F3864"
-C_MED    = "2E75B6"
-C_LIGHT  = "D6E4F0"
-C_TOTAL  = "1F3864"
-C_RESULT = "2E4057"
-C_WHITE  = "FFFFFF"
-C_GRAY   = "F5F7FA"
-C_BORDER = "B8CCE4"
-NUM_FMT  = '#,##0.00;(#,##0.00);"-"'
+NUM_FMT = '#,##0.00;(#,##0.00);"-"'
 
-# ── Mots-clés sections ────────────────────────────────────────────────────────
-SKIP_LABELS = {
-    'brut', 'net', 'amortissements', 'provisions', 'exercice',
-    'exercice precedent', 'a c t i f', 'p a s s i f',
-    'tableau n 1', 'tableau n 2', 'bilan actif', 'bilan passif',
-    'compte de produits', 'designation', 'operations',
-    'propres a l exercice', 'concernant les exercices',
-    'totaux de l exercice',
+# ── Mots-clés de détection des sections ──────────────────────────────────────
+ACTIF_KW  = ["actif immobilise", "immobilisations incorporelles", "bilan (actif",
+              "bilan actif", "actif immobilisé", "frais preliminaires",
+              "frais préliminaires", "immobilisations en non valeur"]
+PASSIF_KW = ["capitaux propres", "bilan (passif", "bilan passif",
+              "capital social", "passif circulant", "dettes de financement",
+              "p a s s i f"]
+CPC_KW    = ["produits exploitation", "charges exploitation",
+             "compte de produits", "ventes de marchandises",
+             "chiffre d affaires", "chiffres d affaires",
+             "produits d exploitation", "charges d exploitation"]
+
+# ── Labels à ignorer (en-têtes parasites) ────────────────────────────────────
+SKIP_EXACT = {
+    "brut", "net", "designation", "operations", "exercice", "exercice precedent",
+    "a c t i f", "p a s s i f", "nb:", "1", "2", "3 = 2 + 1", "4",
+    "propres a l exercice", "concernant les exercices precedents",
+    "totaux de l exercice", "totaux de l exercice precedent",
+    "tableau n 1(1/2)", "tableau n 1(2/2)", "tableau n 2(1/2)", "tableau n 2(2/2)",
+    "bilan (actif) (modele normal)", "bilan (passif) (modele normal)",
+    "compte de produits et charges", "amortissements et provi",
+    "amortissements et provisions",
 }
-SKIP_RE = re.compile(
-    r'^(tableau\s*n|bilan\s*\(|compte\s*de\s*produits|agence\s*du|'
-    r'identifiant\s*fiscal|exercice\s*du|fes\s*le|casablanca\s*le|'
-    r'signature|cadre\s*reserve|\(1\)|\(2\)|nb\s*:|\d+$)',
-    re.IGNORECASE
+SKIP_PREFIX = (
+    "tableau n", "bilan (", "compte de produits", "agence du",
+    "identifiant fiscal", "exercice du", "(1)capital", "(2)benefic",
+    "1)variation", "2)achats revendus", "fes le", "signature",
+    "cadre reserve",
 )
 
-TOTAL_RE   = re.compile(r'^(total\s+[ivi0-9]|total\s+g[eé]n|total\s+a\+)', re.I)
-RESULT_RE  = re.compile(r'^(r[eé]sultat|impots?\s+sur|impôts?\s+sur)', re.I)
-SECTION_RE = re.compile(r'^[A-ZÀÂÉÈÊÎÔÙÛÇ\s]{6,}$')
+# ── Patterns totaux / résultats (pas injectés comme données simples) ──────────
+TOTAL_KW   = ("total i ", "total ii", "total iii", "total general",
+              "total (a+b", "total i+ii", "total iv", "total v ",
+              "total vi", "total vii", "total viii", "total ix",
+              "total xiv", "total xv")
+RESULT_KW  = ("resultat d exploitation", "resultat financier",
+              "resultat courant", "resultat non courant",
+              "resultat avant impot", "resultat net",
+              "impots sur les benefices", "impots sur les bénéfices")
+SECTION_KW = ("produits d exploitation", "charges d exploitation",
+              "produits financiers", "charges financieres",
+              "produits non courant", "charges non courant",
+              "capitaux propres", "dettes de financement",
+              "passif circulant", "tresorerie")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITAIRES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _norm(s):
-    s = unicodedata.normalize('NFD', s).encode('ascii','ignore').decode().lower()
-    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', s)).strip()
+def _norm(s: str) -> str:
+    s = unicodedata.normalize('NFD', s)
+    s = s.encode('ascii', 'ignore').decode('utf-8').lower()
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-def _parse_fr(s):
-    """Parse un nombre FR : '1 234 567,89' ou '1.234.567,89' → float."""
-    if not s: return None
-    s = str(s).strip().replace('\xa0','').replace(' ','')
-    if not s or s in ['-','—','/']: return None
-    neg = s.startswith('-'); s = s.lstrip('-')
-    # Multi-points : 1.234.567,89
-    m = re.match(r'^(\d{1,3}(?:\.\d{3})*),(\d{2})$', s)
-    if m: s = m.group(1).replace('.','') + '.' + m.group(2)
-    elif re.match(r'^\d+,\d{2}$', s): s = s.replace(',','.')
-    elif re.match(r'^\d+$', s): pass
-    else: return None
-    try: return -(float(s)) if neg else float(s)
-    except: return None
+def _parse_num(s) -> float | None:
+    if s is None:
+        return None
+    s = str(s).strip().replace("\n", "").replace("\xa0", "")
+    if not s or s in ["-", "—", "", "None", "/"]:
+        return None
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg, s = True, s[1:-1]
+    if s.startswith("-"):
+        neg, s = True, s[1:]
+    s = s.replace(" ", "").replace(",", ".")
+    try:
+        v = float(s)
+        return -v if neg else v
+    except ValueError:
+        return None
 
-def _is_num_tok(t):
-    return bool(re.match(r'^-?\d+$', t.replace(',','').replace('.',''))) \
-           and len(t.replace(',','').replace('.','')) >= 1
+def _clean_label(s) -> str:
+    if not s:
+        return ""
+    s = str(s).replace("\n", " ").strip()
+    s = re.sub(r"\s{2,}", " ", s)
+    s = re.sub(r"^(I{1,3}|IV|V|VI{1,3}|IX|X{1,3})\s+", "", s)
+    return s.strip()
 
-def _row_type(label):
-    if TOTAL_RE.match(label): return 'total'
-    if RESULT_RE.match(label): return 'result'
-    if SECTION_RE.match(label.strip()) and len(label.strip()) > 5: return 'section'
-    return 'normal'
-
-def _should_skip(label):
-    if not label or len(label.strip()) < 2: return True
+def _should_skip(label: str) -> bool:
     n = _norm(label)
-    if n in SKIP_LABELS: return True
-    if SKIP_RE.match(label.strip()): return True
-    if re.match(r'^\d+$', n): return True
+    if not n or len(n) < 2:
+        return True
+    if n in SKIP_EXACT:
+        return True
+    if any(n.startswith(p) for p in SKIP_PREFIX):
+        return True
+    if re.match(r"^\d+$", n):
+        return True
     return False
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXTRACTION : MÉTHODE 1 — extract_tables()
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _table_usable(table):
-    """Vérifie qu'un tableau a assez de lignes avec des données numériques."""
-    if not table or len(table) < 4: return False
-    n_cols = len(table[0]) if table[0] else 0
-    if n_cols < 2: return False
-    # Compter les lignes avec au moins 1 nombre
-    data_rows = sum(
-        1 for row in table[3:]
-        if any(_parse_fr(str(c)) is not None for c in row if c)
-    )
-    return data_rows >= 3
-
-
-def _extract_via_tables(page):
-    """Extrait les lignes depuis extract_tables()."""
-    tables = page.extract_tables()
-    rows = []
-    for t in tables:
-        if not _table_usable(t): continue
-        n_cols = len(t[0])
-
-        for row in t:
-            if not row: continue
-            cells = [str(c).strip().replace('\n',' ') if c else '' for c in row]
-
-            # Trouver le label (première cellule non-numérique de longueur > 2)
-            label = ''
-            for c in cells:
-                if c and _parse_fr(c) is None and len(c) > 2:
-                    label = c
-                    break
-            if not label: continue
-
-            # Valeurs numériques dans les autres colonnes
-            vals = [_parse_fr(c) for c in cells if _parse_fr(c) is not None]
-
-            if label and (vals or _row_type(label) in ('total','result','section')):
-                rows.append((label.strip(), vals))
-
-    return rows
+def _row_type(label: str) -> str:
+    """Détermine le type visuel d'une ligne selon son label."""
+    n = _norm(label)
+    if any(n.startswith(k) for k in TOTAL_KW) or "total general" in n:
+        return "total"
+    if any(n.startswith(k) for k in RESULT_KW):
+        return "result"
+    if any(n.startswith(k) for k in SECTION_KW):
+        return "section"
+    # Lignes en majuscules = section
+    stripped = label.strip()
+    if stripped and stripped == stripped.upper() and len(stripped) > 4:
+        return "section"
+    return "normal"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXTRACTION : MÉTHODE 2 — X/Y (fallback)
+# EXTRACTION PDF
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _extract_via_xy(page):
-    """Extrait les lignes depuis extract_words() avec positionnement X/Y."""
-    words = page.extract_words(x_tolerance=3, y_tolerance=3)
-    if not words: return []
+class PDFExtractor:
 
-    # Seuil X entre labels et valeurs numériques
-    num_words = [w for w in words if _is_num_tok(w['text']) and w['x0'] > 100]
-    if not num_words: return []
-    thresh = min(w['x0'] for w in num_words) - 5
+    def __init__(self, pdf_path: str):
+        self.pdf    = pdfplumber.open(pdf_path)
+        self.pages  = self.pdf.pages
+        self.n      = len(self.pages)
 
-    # Grouper par Y
-    lines = defaultdict(list)
-    for w in words:
-        lines[round(w['top'] / 3) * 3].append(w)
+    def extract(self) -> dict:
+        ranges  = self._detect_ranges()
+        info    = self._extract_info()
+        actif   = self._extract_section(ranges["actif"],  mode="actif")
+        passif  = self._extract_section(ranges["passif"], mode="passif")
+        cpc     = self._extract_section(ranges["cpc"],    mode="cpc")
+        self.pdf.close()
+        return {"info": info, "actif": actif, "passif": passif, "cpc": cpc,
+                "pages": self.n}
 
-    rows = []
-    prev_label = None
+    def _detect_ranges(self) -> dict:
+        ranges = {"actif": [], "passif": [], "cpc": []}
+        for i, page in enumerate(self.pages):
+            t = _norm(page.extract_text() or "")
+            if any(k in t for k in ACTIF_KW):
+                ranges["actif"].append(i)
+            if any(k in t for k in PASSIF_KW):
+                ranges["passif"].append(i)
+            if any(k in t for k in CPC_KW):
+                ranges["cpc"].append(i)
+        # Fallback
+        if not ranges["actif"]:
+            ranges["actif"] = list(range(1, min(3, self.n)))
+        if not ranges["passif"]:
+            ranges["passif"] = list(range(2, min(5, self.n)))
+        if not ranges["cpc"]:
+            ranges["cpc"] = list(range(3, min(7, self.n)))
+        return ranges
 
-    for y in sorted(lines.keys()):
-        row = sorted(lines[y], key=lambda w: w['x0'])
-        lw  = [w for w in row if w['x0'] < thresh]
-        nw  = [w for w in row if w['x0'] >= thresh and _is_num_tok(w['text'])]
-
-        # Reconstruire le label (filtrer lettres rotatives x<50 longueur<=1)
-        filtered = [w for w in lw
-                    if not (len(w['text']) <= 1
-                            and re.match(r'^[A-Z.]$', w['text'])
-                            and w['x0'] < 50)]
-        label = ''
-        if filtered:
-            label = filtered[0]['text']
-            for i in range(1, len(filtered)):
-                gap = filtered[i]['x0'] - filtered[i-1]['x1']
-                label += filtered[i]['text'] if gap <= 1 else ' ' + filtered[i]['text']
-            label = re.sub(r'\s+', ' ', label).strip()
-
-        # Fusionner les tokens numériques adjacents → valeurs
-        vals = []
-        if nw:
-            nw_s = sorted(nw, key=lambda w: w['x0'])
-            grp  = [nw_s[0]]
-            for w in nw_s[1:]:
-                if w['x0'] - grp[-1]['x1'] < 18:
-                    grp.append(w)
-                else:
-                    raw = ''.join(x['text'] for x in grp)
-                    v   = _parse_fr(raw)
-                    if v is not None: vals.append(v)
-                    grp = [w]
-            raw = ''.join(x['text'] for x in grp)
-            v   = _parse_fr(raw)
-            if v is not None: vals.append(v)
-
-        # Ligne orpheline de valeurs → rattacher au label précédent
-        if not label and vals and prev_label:
-            # Chercher la dernière ligne du résultat et ajouter les valeurs
-            if rows and rows[-1][0] == prev_label:
-                existing = rows[-1][1]
-                if not existing:
-                    rows[-1] = (prev_label, vals)
-                continue
-
-        if label:
-            prev_label = label
-
-        if label and (vals or _row_type(label) in ('total','result','section')):
-            rows.append((label, vals))
-
-    return rows
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SÉLECTION AUTOMATIQUE DE LA MÉTHODE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_page(page):
-    """Choisit la meilleure méthode d'extraction pour une page."""
-    # Essayer extract_tables() d'abord
-    rows_table = _extract_via_tables(page)
-    if len(rows_table) >= 5:
-        logger.info(f"  → extract_tables() : {len(rows_table)} lignes")
-        return rows_table, 'tables'
-
-    # Fallback X/Y
-    rows_xy = _extract_via_xy(page)
-    logger.info(f"  → X/Y fallback : {len(rows_xy)} lignes")
-    return rows_xy, 'xy'
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# INFOS GÉNÉRALES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_info(pdf):
-    info = {}
-    for i in range(min(2, len(pdf.pages))):
-        text = pdf.pages[i].extract_text() or ''
-        for key, pat in [
-            ('raison_sociale',      r'[Rr]aison\s+[Ss]ociale\s*[:\-]?\s*([A-Z][^\n]{3,60})'),
-            ('identifiant_fiscal',  r'[Ii]dentifiant\s+[Ff]iscal\s*[:\-]?\s*(\d+)'),
-            ('taxe_pro',            r'[Tt]axe\s+[Pp]rof\w*\.?\s*[:\-]?\s*([\d\s]+)'),
-            ('adresse',             r'[Aa]dresse\s*[:\-]?\s*([^\n]{5,60})'),
-        ]:
-            if key not in info:
-                m = re.search(pat, text, re.IGNORECASE)
-                if m: info[key] = m.group(1).strip()
-
-        if 'exercice' not in info:
-            m = re.search(r'(\d{2}/\d{2}/\d{4})\s+au\s+(\d{2}/\d{2}/\d{4})', text)
+    def _extract_info(self) -> dict:
+        info = {}
+        for i in range(min(2, self.n)):
+            tables = self.pages[i].extract_tables()
+            for table in tables:
+                for row in table:
+                    cells = [str(c).strip() if c else "" for c in row]
+                    joined = " ".join(cells).lower()
+                    if "raison sociale" in joined:
+                        info.setdefault("raison_sociale", self._last_val(row))
+                    elif "taxe professionnelle" in joined:
+                        info.setdefault("taxe_professionnelle", self._last_val(row))
+                    elif "identifiant fiscal" in joined:
+                        info.setdefault("identifiant_fiscal", self._last_val(row))
+                    elif "adresse" in joined:
+                        info.setdefault("adresse", self._last_val(row))
+        # Exercice depuis texte
+        for i in range(min(5, self.n)):
+            t = self.pages[i].extract_text() or ""
+            m = re.search(r"(\d{2}/\d{2}/\d{4})\s+au\s+(\d{2}/\d{2}/\d{4})", t)
             if m:
-                info['exercice']     = f"Du {m.group(1)} au {m.group(2)}"
-                info['exercice_fin'] = m.group(2)
+                info["exercice"]       = f"Du {m.group(1)} au {m.group(2)}"
+                info["exercice_debut"] = m.group(1)
+                info["exercice_fin"]   = m.group(2)
+                break
+        info.setdefault("raison_sociale", "")
+        info.setdefault("exercice", "")
+        info.setdefault("exercice_fin", "")
+        return info
 
-    for k in ('raison_sociale','identifiant_fiscal','exercice','exercice_fin','taxe_pro','adresse'):
-        info.setdefault(k, '')
-    return info
+    def _last_val(self, row) -> str:
+        cells = [str(c).strip() for c in row if c and str(c).strip()]
+        for c in reversed(cells):
+            if len(c) > 2 and not any(k in c.lower() for k in
+                    ["raison", "taxe", "identifiant", "adresse", ":"]):
+                return c
+        return cells[-1] if cells else ""
+
+    def _extract_section(self, page_indices: list, mode: str) -> list:
+        """
+        Retourne une liste de dicts :
+          actif  : {ref, label, brut, amort, net_n, net_n1, type}
+          passif : {ref, label, val_n, val_n1, type}
+          cpc    : {num, label, propre_n, prec_n, total_n, total_n1, type}
+        """
+        rows = []
+        seen = set()
+
+        for idx in page_indices:
+            if idx >= self.n:
+                continue
+            tables = self.pages[idx].extract_tables()
+            for table in tables:
+                for row in table:
+                    if not row:
+                        continue
+                    parsed = self._parse_row(row, mode)
+                    if parsed is None:
+                        continue
+                    label = parsed.get("label", "")
+                    if not label or _should_skip(label):
+                        continue
+                    key = _norm(label)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    parsed["type"] = _row_type(label)
+                    rows.append(parsed)
+
+        return rows
+
+    def _parse_row(self, row: list, mode: str) -> dict | None:
+        row = [c for c in row]  # keep None
+        n = len(row)
+
+        if mode == "actif":
+            # Structure : [ref?, label, brut, ?, amort, net_n, net_n1]
+            if n >= 7:
+                ref = str(row[0]).strip() if row[0] else ""
+                label = _clean_label(row[1])
+                brut   = _parse_num(row[2])
+                amort  = _parse_num(row[4])
+                net_n  = _parse_num(row[5])
+                net_n1 = _parse_num(row[6])
+            elif n == 6:
+                ref = str(row[0]).strip() if row[0] else ""
+                label = _clean_label(row[1])
+                brut   = _parse_num(row[2])
+                amort  = _parse_num(row[3])
+                net_n  = _parse_num(row[4])
+                net_n1 = _parse_num(row[5])
+            elif n == 5:
+                ref = ""
+                label = _clean_label(row[0])
+                brut   = _parse_num(row[1])
+                amort  = _parse_num(row[2])
+                net_n  = _parse_num(row[3])
+                net_n1 = _parse_num(row[4])
+            elif n >= 3:
+                ref = ""
+                label = _clean_label(row[0])
+                brut   = _parse_num(row[1]) if n > 1 else None
+                amort  = None
+                net_n  = _parse_num(row[2]) if n > 2 else None
+                net_n1 = _parse_num(row[3]) if n > 3 else None
+            else:
+                return None
+            if not label:
+                return None
+            return {"ref": ref, "label": label,
+                    "brut": brut, "amort": amort,
+                    "net_n": net_n, "net_n1": net_n1}
+
+        elif mode == "passif":
+            if n >= 5:
+                ref    = str(row[0]).strip() if row[0] else ""
+                label  = _clean_label(row[1])
+                val_n  = _parse_num(row[3])
+                val_n1 = _parse_num(row[4])
+            elif n == 4:
+                ref    = str(row[0]).strip() if row[0] else ""
+                label  = _clean_label(row[1])
+                val_n  = _parse_num(row[2])
+                val_n1 = _parse_num(row[3])
+            elif n == 3:
+                ref    = ""
+                label  = _clean_label(row[0])
+                val_n  = _parse_num(row[1])
+                val_n1 = _parse_num(row[2])
+            else:
+                return None
+            if not label:
+                return None
+            return {"ref": ref, "label": label, "val_n": val_n, "val_n1": val_n1}
+
+        elif mode == "cpc":
+            if n >= 8:
+                num      = str(row[1]).strip() if row[1] else ""
+                label    = _clean_label(row[2])
+                propre_n = _parse_num(row[3])
+                prec_n   = _parse_num(row[5])
+                total_n  = _parse_num(row[6])
+                total_n1 = _parse_num(row[7])
+            elif n == 7:
+                num      = str(row[1]).strip() if row[1] else ""
+                label    = _clean_label(row[2])
+                propre_n = _parse_num(row[3])
+                prec_n   = _parse_num(row[4])
+                total_n  = _parse_num(row[5])
+                total_n1 = _parse_num(row[6])
+            elif n == 6:
+                num      = str(row[0]).strip() if row[0] else ""
+                label    = _clean_label(row[1])
+                propre_n = _parse_num(row[2])
+                prec_n   = _parse_num(row[3])
+                total_n  = _parse_num(row[4])
+                total_n1 = _parse_num(row[5])
+            elif n == 5:
+                num      = ""
+                label    = _clean_label(row[0])
+                propre_n = _parse_num(row[1])
+                prec_n   = _parse_num(row[2])
+                total_n  = _parse_num(row[3])
+                total_n1 = _parse_num(row[4])
+            else:
+                return None
+            if not label:
+                return None
+            return {"num": num, "label": label,
+                    "propre_n": propre_n, "prec_n": prec_n,
+                    "total_n": total_n, "total_n1": total_n1}
+
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STYLES EXCEL
+# FORMATAGE EXCEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _border():
+def _border(sides="all"):
     s = Side(style='thin', color=C_BORDER)
-    return Border(top=s, bottom=s, left=s, right=s)
+    n = Side(style=None)
+    t = s if sides == "all" or 't' in sides else n
+    b = s if sides == "all" or 'b' in sides else n
+    l = s if sides == "all" or 'l' in sides else n
+    r = s if sides == "all" or 'r' in sides else n
+    return Border(top=t, bottom=b, left=l, right=r)
 
-def _cell(ws, r, c, value=None, bg=C_WHITE, fg='222222', bold=False,
-          align='left', num_fmt=None, size=9, wrap=True, indent=0):
-    cell = ws.cell(row=r, column=c, value=value)
-    cell.font      = Font(name='Arial', size=size, bold=bold, color=fg)
-    cell.fill      = PatternFill('solid', fgColor=bg)
-    cell.alignment = Alignment(horizontal=align, vertical='center',
-                               wrap_text=wrap, indent=indent)
+def _fills(typ):
+    """Retourne (bg_hex, fg_hex, bold) selon le type de ligne."""
+    if typ == "total":
+        return C_DARK_BLUE, C_WHITE, True
+    if typ == "result":
+        return C_RESULT, C_WHITE, True
+    if typ == "section":
+        return C_SECTION, C_DARK_BLUE, True
+    if typ == "subtotal":
+        return C_SUBTOTAL, C_DARK_BLUE, False
+    return C_WHITE, "222222", False
+
+def _set(ws, row, col, value=None, bg=C_WHITE, fg="222222", bold=False,
+         align="left", num_fmt=None, indent=0, wrap=True, size=9):
+    cell = ws.cell(row=row, column=col, value=value)
+    cell.font      = Font(name="Arial", size=size, bold=bold, color=fg)
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal=align, vertical="center",
+                               indent=indent, wrap_text=wrap)
     cell.border    = _border()
-    if num_fmt: cell.number_format = num_fmt
+    if num_fmt:
+        cell.number_format = num_fmt
     return cell
 
-def _row_style(row_type):
-    """Retourne (bg, fg, bold) selon le type de ligne."""
-    if row_type == 'total':   return C_TOTAL,  C_WHITE, True
-    if row_type == 'result':  return C_RESULT, C_WHITE, True
-    if row_type == 'section': return C_LIGHT,  C_DARK,  True
-    return C_WHITE, '222222', False
+def _header_row(ws, r, labels_cols: list, height=28):
+    """labels_cols : [(col_start, col_end, text, bg)]"""
+    ws.row_dimensions[r].height = height
+    for col_s, col_e, text, bg in labels_cols:
+        if col_s != col_e:
+            ws.merge_cells(start_row=r, start_column=col_s,
+                           end_row=r, end_column=col_e)
+        _set(ws, r, col_s, text, bg=bg, fg=C_WHITE, bold=True,
+             align="center", size=10, wrap=True)
+
+def _cover(ws, r, raison, exercice, if_num, title, n_cols):
+    """Bloc titre + infos entreprise. Retourne la prochaine ligne."""
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n_cols)
+    _set(ws, r, 1, title, bg=C_DARK_BLUE, fg=C_WHITE, bold=True,
+         align="center", size=12)
+    ws.row_dimensions[r].height = 26
+    r += 1
+
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n_cols-2 or 1)
+    _set(ws, r, 1, f"Raison sociale : {raison}",
+         bg=C_LIGHT_BLUE, fg=C_DARK_BLUE, bold=True, size=9, indent=1)
+    if n_cols >= 3:
+        ws.merge_cells(start_row=r, start_column=n_cols-1,
+                       end_row=r, end_column=n_cols)
+        _set(ws, r, n_cols-1, f"IF : {if_num}",
+             bg=C_LIGHT_BLUE, fg=C_DARK_BLUE, align="right", size=9)
+    ws.row_dimensions[r].height = 16
+    r += 1
+
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n_cols)
+    _set(ws, r, 1, f"Exercice : {exercice}",
+         bg=C_GRAY_BG, fg="555555", size=9, indent=1)
+    ws.row_dimensions[r].height = 14
+    r += 1
+
+    # Ligne séparatrice vide
+    for c in range(1, n_cols+1):
+        _set(ws, r, c, bg=C_WHITE)
+    ws.row_dimensions[r].height = 4
+    r += 1
+    return r
+
+def _data_row(ws, r, row_type, cells_data):
+    """
+    cells_data : [(col, value, align, is_num)]
+    """
+    bg, fg, bold = _fills(row_type)
+    h = 15 if row_type == "normal" else 17
+    ws.row_dimensions[r].height = h
+    for col, value, align, is_num in cells_data:
+        _set(ws, r, col, value, bg=bg, fg=fg, bold=bold,
+             align=align, num_fmt=NUM_FMT if is_num else None,
+             indent=1 if (align == "left" and row_type == "normal") else 0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ÉCRITURE DES FEUILLES
+# CONSTRUCTION DES FEUILLES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _write_identification(wb, info):
-    ws = wb.create_sheet('1 — Identification')
+def _sheet_identification(wb, info):
+    ws = wb.create_sheet("1 — Identification")
     ws.sheet_view.showGridLines = False
-    ws.column_dimensions['A'].width = 28
-    ws.column_dimensions['B'].width = 50
+    ws.column_dimensions['A'].width = 30
+    ws.column_dimensions['B'].width = 46
 
     ws.merge_cells('A1:B1')
-    _cell(ws, 1, 1, 'PIÈCES ANNEXES À LA DÉCLARATION FISCALE',
-          bg=C_DARK, fg=C_WHITE, bold=True, align='center', size=13)
-    ws.row_dimensions[1].height = 26
+    _set(ws, 1, 1, "PIÈCES ANNEXES À LA DÉCLARATION FISCALE",
+         bg=C_DARK_BLUE, fg=C_WHITE, bold=True, align="center", size=13)
+    ws.row_dimensions[1].height = 28
 
     ws.merge_cells('A2:B2')
-    _cell(ws, 2, 1, 'IMPÔTS SUR LES SOCIÉTÉS — Modèle Comptable Normal (loi 9-88)',
-          bg=C_MED, fg=C_WHITE, align='center', size=10)
+    _set(ws, 2, 1, "IMPÔTS SUR LES SOCIÉTÉS — Modèle Comptable Normal (loi 9-88)",
+         bg=C_MED_BLUE, fg=C_WHITE, align="center", size=10)
     ws.row_dimensions[2].height = 18
 
     fields = [
-        ('Raison sociale',        info['raison_sociale']),
-        ('Identifiant fiscal',    info['identifiant_fiscal']),
-        ('Taxe professionnelle',  info['taxe_pro']),
-        ('Adresse',               info['adresse']),
-        ('Exercice',              info['exercice']),
+        ("Raison sociale",       info.get("raison_sociale", "—")),
+        ("Identifiant fiscal",   info.get("identifiant_fiscal", "—")),
+        ("Taxe professionnelle", info.get("taxe_professionnelle", "—")),
+        ("Adresse",              info.get("adresse", "—")),
+        ("Exercice",             info.get("exercice", "—")),
     ]
     for i, (lbl, val) in enumerate(fields, 4):
         ws.row_dimensions[i].height = 18
-        _cell(ws, i, 1, lbl, bg=C_LIGHT, fg=C_DARK, bold=True, size=9, indent=1)
-        _cell(ws, i, 2, val, bg=C_WHITE,  fg='222222', size=9, indent=1)
+        _set(ws, i, 1, lbl, bg=C_LIGHT_BLUE, fg=C_DARK_BLUE, bold=True,
+             size=9, indent=1)
+        _set(ws, i, 2, val, bg=C_WHITE, fg="222222", size=9, indent=1)
 
 
-def _write_data_sheet(wb, sheet_name, headers, rows):
-    """
-    Écrit une feuille de données.
-    headers : liste de strings pour les colonnes valeurs
-    rows    : [(label, [val1, val2, ...]), ...]
-    """
-    ws = wb.create_sheet(sheet_name)
+def _sheet_actif(wb, info, rows):
+    ws = wb.create_sheet("2 — Bilan Actif")
     ws.sheet_view.showGridLines = False
+    ws.column_dimensions['A'].width = 4
+    ws.column_dimensions['B'].width = 46
+    ws.column_dimensions['C'].width = 18
+    ws.column_dimensions['D'].width = 18
+    ws.column_dimensions['E'].width = 18
+    ws.column_dimensions['F'].width = 18
 
-    # Déterminer le nombre de colonnes valeurs
-    max_vals = max((len(vals) for _, vals in rows if vals), default=len(headers))
-    n_headers = max(len(headers), max_vals)
-    total_cols = 1 + n_headers  # col 1 = label, cols 2..n = valeurs
+    r = _cover(ws, 1, info.get("raison_sociale", ""), info.get("exercice", ""),
+               info.get("identifiant_fiscal", ""), "BILAN ACTIF — Modèle Comptable Normal", 6)
 
-    # Largeurs
-    ws.column_dimensions['A'].width = 50
-    for c in range(2, total_cols + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 18
+    _header_row(ws, r, [
+        (1, 2, "ACTIF",             C_DARK_BLUE),
+        (3, 3, "BRUT",              C_MED_BLUE),
+        (4, 4, "AMORT. & PROV.",    C_MED_BLUE),
+        (5, 5, "NET — EXERCICE N",  C_DARK_BLUE),
+        (6, 6, "NET — EXERCICE N-1",C_MED_BLUE),
+    ])
+    ws.freeze_panes = f"A{r+1}"
+    r += 1
 
-    # Titre
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
-    _cell(ws, 1, 1, sheet_name.split('—')[-1].strip(),
-          bg=C_DARK, fg=C_WHITE, bold=True, align='center', size=12)
-    ws.row_dimensions[1].height = 22
-
-    # Headers colonnes
-    _cell(ws, 2, 1, 'DÉSIGNATION', bg=C_MED, fg=C_WHITE, bold=True,
-          align='center', size=9)
-    for ci, h in enumerate(headers[:n_headers], 2):
-        _cell(ws, 2, ci, h, bg=C_MED, fg=C_WHITE, bold=True,
-              align='center', size=9, wrap=True)
-    ws.row_dimensions[2].height = 28
-    ws.freeze_panes = 'A3'
-
-    # Données
-    r = 3
-    for label, vals in rows:
-        rtype = _row_type(label)
-        bg, fg, bold = _row_style(rtype)
-        ws.row_dimensions[r].height = 15 if rtype == 'normal' else 17
-
-        # Label
-        indent = 1 if rtype == 'normal' else 0
-        _cell(ws, r, 1, label, bg=bg, fg=fg, bold=bold,
-              align='left', size=9, indent=indent)
-
-        # Valeurs
-        for ci, v in enumerate(vals[:n_headers], 2):
-            _cell(ws, r, ci, v, bg=bg, fg=fg, bold=bold,
-                  align='right', size=9,
-                  num_fmt=NUM_FMT if isinstance(v, (int, float)) else None)
-
-        # Cellules vides restantes
-        for ci in range(len(vals) + 2, total_cols + 1):
-            _cell(ws, r, ci, bg=bg, fg=fg)
-
+    total_rows = 0
+    for d in rows:
+        typ = d.get("type", "normal")
+        ref = d.get("ref") or ""
+        # Cellule référence
+        _data_row(ws, r, typ, [
+            (1, ref if ref else None, "center", False),
+            (2, d["label"],  "left",  False),
+            (3, d.get("brut"),  "right", True),
+            (4, d.get("amort"), "right", True),
+            (5, d.get("net_n"), "right", True),
+            (6, d.get("net_n1"),"right", True),
+        ])
+        # Ref cell styling overrides
+        bg, fg, bold = _fills(typ)
+        c_ref = ws.cell(row=r, column=1)
+        c_ref.font = Font(name="Arial", size=8, bold=True,
+                          color=C_MED_BLUE if typ not in ("total","result") else C_WHITE)
+        c_ref.fill = PatternFill("solid", fgColor=bg)
         r += 1
+        total_rows += 1
 
-    return r - 3  # nb lignes écrites
+    return total_rows
+
+
+def _sheet_passif(wb, info, rows):
+    ws = wb.create_sheet("3 — Bilan Passif")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions['A'].width = 4
+    ws.column_dimensions['B'].width = 48
+    ws.column_dimensions['C'].width = 20
+    ws.column_dimensions['D'].width = 20
+
+    r = _cover(ws, 1, info.get("raison_sociale", ""), info.get("exercice", ""),
+               info.get("identifiant_fiscal", ""), "BILAN PASSIF — Modèle Comptable Normal", 4)
+
+    _header_row(ws, r, [
+        (1, 2, "PASSIF",         C_DARK_BLUE),
+        (3, 3, "EXERCICE N",     C_DARK_BLUE),
+        (4, 4, "EXERCICE N-1",   C_MED_BLUE),
+    ])
+    ws.freeze_panes = f"A{r+1}"
+    r += 1
+
+    total_rows = 0
+    for d in rows:
+        typ = d.get("type", "normal")
+        ref = d.get("ref") or ""
+        _data_row(ws, r, typ, [
+            (1, ref if ref else None, "center", False),
+            (2, d["label"],  "left",  False),
+            (3, d.get("val_n"),  "right", True),
+            (4, d.get("val_n1"), "right", True),
+        ])
+        bg, fg, bold = _fills(typ)
+        c_ref = ws.cell(row=r, column=1)
+        c_ref.font = Font(name="Arial", size=8, bold=True,
+                          color=C_MED_BLUE if typ not in ("total","result") else C_WHITE)
+        c_ref.fill = PatternFill("solid", fgColor=bg)
+        r += 1
+        total_rows += 1
+
+    # Note légale
+    r += 1
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+    c = ws.cell(row=r, column=1,
+                value="(1) Capital personnel débiteur.  (2) Bénéficiaire (+) / Déficitaire (−).")
+    c.font = Font(name="Arial", italic=True, size=8, color="888888")
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+    return total_rows
+
+
+def _sheet_cpc(wb, info, rows):
+    ws = wb.create_sheet("4 — CPC")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions['A'].width = 5
+    ws.column_dimensions['B'].width = 48
+    ws.column_dimensions['C'].width = 18
+    ws.column_dimensions['D'].width = 18
+    ws.column_dimensions['E'].width = 18
+    ws.column_dimensions['F'].width = 18
+
+    r = _cover(ws, 1, info.get("raison_sociale", ""), info.get("exercice", ""),
+               info.get("identifiant_fiscal", ""),
+               "COMPTE DE PRODUITS ET CHARGES (Hors Taxes)", 6)
+
+    _header_row(ws, r, [
+        (1, 2, "DÉSIGNATION",           C_DARK_BLUE),
+        (3, 3, "PROPRES À\nL'EXERCICE", C_MED_BLUE),
+        (4, 4, "EXERCICES\nPRÉCÉDENTS", C_MED_BLUE),
+        (5, 5, "TOTAUX\nEXERCICE N",    C_DARK_BLUE),
+        (6, 6, "TOTAUX\nEXERCICE N-1",  C_MED_BLUE),
+    ])
+    ws.freeze_panes = f"A{r+1}"
+    r += 1
+
+    total_rows = 0
+    for d in rows:
+        typ = d.get("type", "normal")
+        num = d.get("num") or ""
+        _data_row(ws, r, typ, [
+            (1, num if num else None, "center", False),
+            (2, d["label"],      "left",  False),
+            (3, d.get("propre_n"), "right", True),
+            (4, d.get("prec_n"),   "right", True),
+            (5, d.get("total_n"),  "right", True),
+            (6, d.get("total_n1"), "right", True),
+        ])
+        bg, fg, bold = _fills(typ)
+        c_num = ws.cell(row=r, column=1)
+        c_num.font = Font(name="Arial", size=8, bold=True,
+                          color=C_MED_BLUE if typ not in ("total","result") else C_WHITE)
+        c_num.fill = PatternFill("solid", fgColor=bg)
+        r += 1
+        total_rows += 1
+
+    r += 1
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    c = ws.cell(row=r, column=1,
+                value="(1) Stock final − Stock initial : Augmentation (+) / Diminution (−).   "
+                      "(2) Achats revendus = Achats − Variation de stock.")
+    c.font = Font(name="Arial", italic=True, size=8, color="888888")
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+    return total_rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DÉTECTION DES HEADERS PDF
+# POINT D'ENTRÉE PUBLIC
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _detect_headers(page, thresh_y=80):
-    """
-    Extrait les labels des colonnes valeurs depuis les premières lignes de la page.
-    Retourne une liste de strings.
-    """
-    text = page.extract_text() or ''
-    lines = text.split('\n')
-
-    # Chercher les lignes qui ressemblent à des headers de colonnes
-    header_kw = {
-        'brut': 'Brut',
-        'amortissements': 'Amort. & Prov.',
-        'net': 'Net (N)',
-        'exercice precedent': 'Net (N-1)',
-        'precedent': 'Net (N-1)',
-        'exercice n': 'Exercice N',
-        'propres': 'Propres N',
-        'exercices prec': 'Exerc. Préc.',
-        'totaux': 'Total N',
-    }
-    found = []
-    for line in lines[:10]:
-        n = _norm(line)
-        for kw, label in header_kw.items():
-            if kw in n and label not in found:
-                found.append(label)
-
-    # Fallback : noms génériques selon nb de colonnes
-    return found or ['Valeur 1', 'Valeur 2', 'Valeur 3', 'Valeur 4']
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# POINT D'ENTRÉE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# Noms des feuilles selon la page
-PAGE_SHEETS = {
-    0: None,          # Page 1 → ignorée (infos, gérée séparément)
-    1: '2 — Bilan Actif',
-    2: '3 — Bilan Passif',
-    3: '4 — CPC (1)',
-    4: '5 — CPC (2)',
-    5: '6 — CPC (3)',
-    6: '7 — Annexes',
-}
-
-# DGI : 7 pages → décalage
-PAGE_SHEETS_DGI = {
-    0: None,
-    1: '2 — Bilan Actif (1)',
-    2: '2 — Bilan Actif (2)',
-    3: '3 — Bilan Passif',
-    4: '4 — CPC (1)',
-    5: '5 — CPC (2)',
-    6: '6 — CPC (3)',
-}
-
 
 def convert(pdf_path: str, output_path: str) -> dict:
     """
-    Convertit un PDF fiscal en Excel structuré.
-    Retourne dict avec info, tables, rows, pages.
+    Extrait le PDF fiscal et génère un Excel structuré et formaté.
+
+    Retourne un dict :
+      {info, tables, rows, pages}
+    compatible avec app.py (stats['tables'], stats['rows'], stats['pages']).
     """
-    pdf    = pdfplumber.open(pdf_path)
-    n      = len(pdf.pages)
-    info   = _extract_info(pdf)
-    is_dgi = (n == 7)
+    # 1. Extraction
+    extractor = PDFExtractor(pdf_path)
+    data = extractor.extract()
 
-    page_map = PAGE_SHEETS_DGI if is_dgi else PAGE_SHEETS
+    info   = data["info"]
+    actif  = data["actif"]
+    passif = data["passif"]
+    cpc    = data["cpc"]
 
-    wb = openpyxl.Workbook()
+    # 2. Construction du workbook
+    wb = Workbook()
     wb.remove(wb.active)
-    _write_identification(wb, info)
 
-    total_tables = 0
-    total_rows   = 0
-    used_names   = set()
+    _sheet_identification(wb, info)
+    n_actif  = _sheet_actif(wb, info, actif)
+    n_passif = _sheet_passif(wb, info, passif)
+    n_cpc    = _sheet_cpc(wb, info, cpc)
 
-    for page_idx, page in enumerate(pdf.pages):
-        sheet_name = page_map.get(page_idx)
-        if sheet_name is None:
-            continue
-
-        # Éviter les doublons de nom de feuille
-        base_name = sheet_name
-        cnt = 2
-        while sheet_name in used_names:
-            sheet_name = f"{base_name} ({cnt})"
-            cnt += 1
-        used_names.add(sheet_name)
-
-        logger.info(f"Page {page_idx+1} → '{sheet_name}'")
-        rows, method = _extract_page(page)
-
-        # Filtrer les lignes parasites
-        rows = [(lbl, vals) for lbl, vals in rows
-                if not _should_skip(lbl)]
-
-        if not rows:
-            logger.info(f"  → page vide, ignorée")
-            continue
-
-        # Détecter les headers colonnes depuis la page
-        headers = _detect_headers(page)
-
-        n_written = _write_data_sheet(wb, sheet_name, headers, rows)
-        total_tables += 1
-        total_rows   += n_written
-        logger.info(f"  → {n_written} lignes écrites (méthode: {method})")
-
-    pdf.close()
     wb.save(output_path)
 
-    logger.info(f"Excel sauvegardé : {total_tables} feuilles, {total_rows} lignes")
+    total_rows   = n_actif + n_passif + n_cpc
+    total_tables = sum([
+        1 if actif  else 0,
+        1 if passif else 0,
+        1 if cpc    else 0,
+    ])
+
     return {
-        'info':   info,
-        'tables': total_tables,
-        'rows':   total_rows,
-        'pages':  n,
+        "info":   info,
+        "tables": total_tables,
+        "rows":   total_rows,
+        "pages":  data["pages"],
     }
