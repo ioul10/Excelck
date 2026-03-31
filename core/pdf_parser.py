@@ -81,9 +81,9 @@ class PDFParser:
     def parse(self) -> dict:
         result = {
             "info":          self._parse_info(),
-            "actif_values":  self._extract_section(pages=[1, 2],    mode='actif'),
-            "passif_values": self._extract_section(pages=[2, 3],    mode='passif'),
-            "cpc_values":    self._extract_section(pages=[3, 4, 5], mode='cpc'),
+            "actif_values":  self._extract_section(pages=[1],    mode='actif'),
+            "passif_values": self._extract_section(pages=[3],    mode='passif'),
+            "cpc_values":    self._extract_section(pages=[4, 5], mode='cpc'),
         }
         self._enrich_passif(result)
         return result
